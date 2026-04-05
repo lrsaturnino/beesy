@@ -1,0 +1,25 @@
+gate:
+  id: test-trivial
+  name: "Test Trivial Gate"
+  command: /test-trivial
+  description: "Minimal single-step gate for testing the end-to-end pipeline"
+
+input:
+  required:
+    - description: "A brief description of what to test"
+
+workflow:
+  steps:
+    - echo
+
+steps:
+  echo:
+    execution:
+      type: agent
+      config:
+        model: anthropic/claude-sonnet-4-20250514
+        tools:
+          - read
+          - write
+        timeoutMs: 60000
+    behavior: "Echoes the input description back as output for pipeline verification"
