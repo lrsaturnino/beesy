@@ -130,6 +130,15 @@ function mapExitCodeToOutput(
     };
   }
 
+  // Any other non-zero exit code is a failure
+  if (exitCode !== 0) {
+    const errorMessage =
+      stderrLines.length > 0
+        ? stderrLines.join("\n")
+        : `Script exited with code ${exitCode}`;
+    return { output: "", outputFiles: [], error: errorMessage, exitCode };
+  }
+
   // Exit code 0: success -- parse stdout JSON
   const parsed = parseStdoutJson(rawStdout);
   if (parsed.error) {
@@ -218,6 +227,13 @@ export async function runScript(
         clearTimeout(sigkillTimer);
       }
     }
+
+    // Guard against EPIPE if the child exits before stdin is consumed
+    child.stdin.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code !== "EPIPE") {
+        logger.warn("stdin write error", { command, error: err.message });
+      }
+    });
 
     // Pipe context as JSON to subprocess stdin, then close the stream
     child.stdin.write(stdinPayload);

@@ -63,14 +63,17 @@ function snakeToCamel(key: string): string {
  *
  * Handles nested objects and arrays. Primitive values pass through unchanged.
  */
-function transformKeys(value: unknown): unknown {
+function transformKeys(value: unknown, preserveChildKeys = false): unknown {
   if (Array.isArray(value)) {
-    return value.map(transformKeys);
+    return value.map((v) => transformKeys(v, false));
   }
   if (value !== null && typeof value === "object") {
     const result: Record<string, unknown> = {};
     for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-      result[snakeToCamel(key)] = transformKeys(val);
+      const outputKey = preserveChildKeys ? key : snakeToCamel(key);
+      // Preserve step ID keys (user-defined identifiers, not schema fields)
+      const isStepIdMap = key === "steps" && val !== null && typeof val === "object" && !Array.isArray(val);
+      result[outputKey] = transformKeys(val, isStepIdMap);
     }
     return result;
   }
@@ -558,8 +561,12 @@ async function listYamlFiles(gatesDir: string): Promise<string[]> {
   try {
     const entries = await readdir(gatesDir);
     return entries.filter((f) => f.endsWith(".yaml") || f.endsWith(".yml"));
-  } catch {
-    return [];
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      return [];
+    }
+    throw err;
   }
 }
 

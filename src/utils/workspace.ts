@@ -8,7 +8,7 @@
  * @module utils/workspace
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createLogger } from "./logger.js";
 
 const logger = createLogger(process.env.LOG_LEVEL ?? "info");
@@ -46,8 +46,7 @@ function extractErrorMessage(err: unknown): string {
  * @returns Trimmed stdout from the git command
  */
 function runGit(args: string[], cwd?: string): string {
-  const command = `git ${args.join(" ")}`;
-  return execSync(command, {
+  return execFileSync("git", args, {
     cwd,
     stdio: "pipe",
     timeout: GIT_COMMAND_TIMEOUT_MS,
@@ -185,7 +184,7 @@ export async function createWorkspace(
   // Create the worktree with a new branch from the base branch
   try {
     runGit(
-      ["-C", `"${repoPath}"`, "worktree", "add", `"${worktreePath}"`, "-b", `"${branchName}"`, `"${baseBranch}"`],
+      ["-C", repoPath, "worktree", "add", worktreePath, "-b", branchName, baseBranch],
     );
   } catch (err) {
     const message = extractErrorMessage(err);
@@ -200,8 +199,8 @@ export async function createWorkspace(
 
   // Configure git identity in the worktree
   try {
-    runGit(["-C", `"${worktreePath}"`, "config", "user.name", `"${gitName}"`]);
-    runGit(["-C", `"${worktreePath}"`, "config", "user.email", `"${gitEmail}"`]);
+    runGit(["-C", worktreePath, "config", "user.name", gitName]);
+    runGit(["-C", worktreePath, "config", "user.email", gitEmail]);
   } catch (err) {
     const message = extractErrorMessage(err);
     logger.error("Failed to configure git identity", {
@@ -228,7 +227,7 @@ export async function cleanupWorkspace(
 
   // Remove the worktree (non-existent worktree is not an error)
   try {
-    runGit(["-C", `"${repoPath}"`, "worktree", "remove", "--force", `"${worktreePath}"`]);
+    runGit(["-C", repoPath, "worktree", "remove", "--force", worktreePath]);
   } catch (err) {
     const message = extractErrorMessage(err);
     logger.warn("Worktree removal returned an error (may already be gone)", {
@@ -240,7 +239,7 @@ export async function cleanupWorkspace(
   // Delete the branch if requested
   if (deleteBranch && branchName) {
     try {
-      runGit(["-C", `"${repoPath}"`, "branch", "-D", `"${branchName}"`]);
+      runGit(["-C", repoPath, "branch", "-D", branchName]);
       logger.info("Branch deleted", { branchName });
     } catch (err) {
       const message = extractErrorMessage(err);

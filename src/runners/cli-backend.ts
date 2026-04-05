@@ -161,10 +161,17 @@ export class CLIAgentBackend implements AgentBackend {
     }
 
     let timedOut = false;
+    let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
 
     const timeoutHandle = setTimeout(() => {
       timedOut = true;
       childProcess.kill("SIGTERM");
+      // Escalate to SIGKILL if the process ignores SIGTERM
+      sigkillTimer = setTimeout(() => {
+        if (childProcess.exitCode === null) {
+          childProcess.kill("SIGKILL");
+        }
+      }, 5_000);
       logger.warn(`Process timed out after ${config.timeoutMs}ms`, {
         backend: this.name,
         stepId: context.stepId,
@@ -175,6 +182,9 @@ export class CLIAgentBackend implements AgentBackend {
     return new Promise<StepOutput>((resolve) => {
       childProcess.on("close", (code: number | null) => {
         clearTimeout(timeoutHandle);
+        if (sigkillTimer !== undefined) {
+          clearTimeout(sigkillTimer);
+        }
 
         const exitCode = code ?? 1;
         const stdoutText = Buffer.concat(stdoutChunks).toString("utf-8");
@@ -193,6 +203,29 @@ export class CLIAgentBackend implements AgentBackend {
             const message = err instanceof Error ? err.message : String(err);
             logger.error("State flag transition failed", { error: message, backend: this.name });
             resolve(buildStepOutput(stdoutText, stdoutText, stderrText, exitCode, timedOut, config, context));
+          });
+      });
+
+      childProcess.on("error", (err: Error) => {
+        clearTimeout(timeoutHandle);
+        if (sigkillTimer !== undefined) {
+          clearTimeout(sigkillTimer);
+        }
+        logger.error(`Failed to spawn ${this.adapter.cliCommand}`, {
+          backend: this.name,
+          stepId: context.stepId,
+          error: err.message,
+        });
+        void setupPromise
+          .then(() => transitionStateFlag(paths.pendingFlag, tempDir, context.stepId, runId, "failed"))
+          .catch(() => {})
+          .then(() => {
+            resolve({
+              output: "",
+              outputFiles: [],
+              error: `Failed to spawn ${this.adapter.cliCommand}: ${err.message}`,
+              exitCode: 1,
+            });
           });
       });
     });

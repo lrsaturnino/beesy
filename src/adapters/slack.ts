@@ -124,12 +124,16 @@ export class SlackAdapter implements Adapter {
       this.notifyListeners(normalized);
     });
 
-    // App mention event handler
+    // App mention event handler — parse stripped text into slash command + args
     this.app.event("app_mention", async ({ event }) => {
       const mention = event as unknown as MentionEventFields;
+      const stripped = stripBotMention(mention.text ?? "").trim();
+      const [rawCommand = "", ...rest] = stripped.split(/\s+/);
+      // Ensure the command starts with "/" so it can match gate commands
+      const command = rawCommand.startsWith("/") ? rawCommand : `/${rawCommand}`;
       const normalized: NormalizedMessage = {
-        command: "@bees",
-        payload: { text: stripBotMention(mention.text ?? "") },
+        command,
+        payload: { text: rest.join(" ") },
         channel: {
           platform: "slack",
           channelId: mention.channel,

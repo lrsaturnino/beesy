@@ -176,13 +176,27 @@ function createMessageHandler(
 
     const gateConfig = router.match(message.command);
 
-    void adapter.sendReply(
-      message.channel,
-      `Task ${task.id} queued for gate "${task.gate}".`,
-    );
-
     const enrichedTask = Object.assign({}, task, { gateConfig }) as Task;
-    void queue.enqueue(enrichedTask);
+    void queue
+      .enqueue(enrichedTask)
+      .then(() =>
+        adapter.sendReply(
+          message.channel,
+          `Task ${task.id} queued for gate "${task.gate}".`,
+        ),
+      )
+      .catch((error: unknown) => {
+        const errorText = extractErrorMessage(error);
+        log.error("Failed to enqueue task", {
+          taskId: task.id,
+          command: message.command,
+          error: errorText,
+        });
+        return adapter.sendReply(
+          message.channel,
+          `Task ${task.id} could not be queued: ${errorText}`,
+        );
+      });
   };
 }
 
@@ -248,31 +262,47 @@ export async function startApp(options?: StartAppOptions): Promise<AppHandle> {
   const messageHandler = createMessageHandler(router, adapter, queue, log);
   adapter.onMessage(messageHandler);
 
-  // Connect the Slack adapter (starts Socket Mode)
-  await adapter.connect();
+  // Connect the Slack adapter (starts Socket Mode).
+  // Clean up queue/worker resources if connection fails.
+  try {
+    await adapter.connect();
+  } catch (error) {
+    await Promise.allSettled([queue.close(), adapter.disconnect()]);
+    throw error;
+  }
 
   log.info("Application started successfully", { gatesDir });
 
-  // Idempotency guard for shutdown
-  let shuttingDown = false;
+  // Shared shutdown promise so concurrent callers await the same operation
+  let shutdownPromise: Promise<void> | null = null;
 
   /** Coordinated shutdown of all components. Removes its own signal listeners. */
-  const shutdown = async (): Promise<void> => {
-    if (shuttingDown) {
-      return;
+  const shutdown = (): Promise<void> => {
+    if (shutdownPromise) {
+      return shutdownPromise;
     }
-    shuttingDown = true;
+    shutdownPromise = (async () => {
+      // Remove signal listeners to prevent listener accumulation across restarts
+      process.off("SIGTERM", signalHandler);
+      process.off("SIGINT", signalHandler);
 
-    // Remove signal listeners to prevent listener accumulation across restarts
-    process.off("SIGTERM", signalHandler);
-    process.off("SIGINT", signalHandler);
+      log.info("Shutting down application");
 
-    log.info("Shutting down application");
+      const [adapterResult, queueResult] = await Promise.allSettled([
+        adapter.disconnect(),
+        queue.close(),
+      ]);
+      if (adapterResult.status === "rejected") {
+        log.error("Adapter disconnect failed", { error: extractErrorMessage(adapterResult.reason) });
+      }
+      if (queueResult.status === "rejected") {
+        log.error("Queue close failed", { error: extractErrorMessage(queueResult.reason) });
+      }
 
-    await adapter.disconnect();
-    await queue.close();
+      log.info("Application shutdown complete");
+    })();
 
-    log.info("Application shutdown complete");
+    return shutdownPromise;
   };
 
   /** Bound signal handler enabling cleanup via process.off on shutdown. */

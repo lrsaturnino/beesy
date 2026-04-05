@@ -18,6 +18,8 @@
  * @module executor/tool-runner
  */
 
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { createLogger } from "../utils/logger.js";
 import type { StepContext, StepOutput } from "../runners/types.js";
 
@@ -148,7 +150,13 @@ export async function runTool(
   context: StepContext,
   options?: ToolRunnerOptions,
 ): Promise<StepOutput> {
-  const importFn = options?.importFn ?? ((path: string) => import(path) as Promise<Record<string, unknown>>);
+  const importFn = options?.importFn ?? ((modulePath: string) => {
+    // Bare specifiers (e.g. "src/tools/foo") need conversion to file:// URLs for ESM
+    const specifier = modulePath.startsWith("file://") || modulePath.startsWith("/") || modulePath.startsWith(".")
+      ? modulePath
+      : pathToFileURL(path.resolve(modulePath)).href;
+    return import(specifier) as Promise<Record<string, unknown>>;
+  });
   const timeoutMs = options?.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
 
   // Attempt to import the module

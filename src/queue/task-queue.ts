@@ -177,6 +177,13 @@ export class TaskQueue {
    * @param processor - Async callback invoked for each dequeued job
    */
   startWorker(processor: (job: Job) => Promise<void>): void {
+    if (this.closed) {
+      throw new Error("Cannot start worker after TaskQueue.close()");
+    }
+    if (this.worker) {
+      throw new Error("TaskQueue worker already started");
+    }
+
     const worker = new Worker(this.queueName, processor, {
       connection: this.connection,
       concurrency: 1,
