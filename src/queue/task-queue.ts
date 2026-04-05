@@ -116,7 +116,9 @@ export class TaskQueue {
 
   constructor(options: TaskQueueOptions) {
     this.queueName = options.queueName ?? DEFAULT_QUEUE_NAME;
-    this.connection = new Redis(options.redisUrl);
+    this.connection = new Redis(options.redisUrl, {
+      maxRetriesPerRequest: null,
+    });
 
     this.connection.on("error", (err: unknown) => {
       const message = extractErrorMessage(err);
