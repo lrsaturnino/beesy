@@ -294,9 +294,11 @@ describe("@bees mention parsing", () => {
     });
 
     expect(received).toHaveLength(1);
+    // Mention text is now parsed: first word becomes slash command, rest is payload
+    expect(received[0].command).toBe("/run");
     const payloadText = received[0].payload.text as string;
     expect(payloadText).not.toMatch(/^<@/);
-    expect(payloadText).toBe("run the implementation gate");
+    expect(payloadText).toBe("the implementation gate");
   });
 });
 

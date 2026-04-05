@@ -452,8 +452,10 @@ describe("message routing", () => {
       ack: mockAck,
     });
 
-    // Acknowledgment should be sent via postMessage to the source channel
-    expect(mockPostMessage).toHaveBeenCalled();
+    // Reply is now sent asynchronously after enqueue resolves
+    await vi.waitFor(() => {
+      expect(mockPostMessage).toHaveBeenCalled();
+    });
     const postArgs = mockPostMessage.mock.calls[0]?.[0];
     expect(postArgs?.channel).toBe("C999");
   });
@@ -468,6 +470,10 @@ describe("worker processing", () => {
     await writeGateYaml("test-trivial.yaml", TEST_TRIVIAL_YAML);
 
     app = await startApp({ gatesDir: tempDir });
+
+    // Register a mock backend so the worker doesn't spawn real CLI binaries
+    const { registerBackend } = await import("../../src/runners/registry.js");
+    registerBackend("cli-claude", createMockBackend("cli-claude", "mock output"));
 
     // Verify processor was captured
     expect(capturedProcessor).not.toBeNull();
@@ -524,6 +530,10 @@ describe("worker processing", () => {
     await writeGateYaml("test-trivial.yaml", TEST_TRIVIAL_YAML);
 
     app = await startApp({ gatesDir: tempDir });
+
+    // Register a mock backend so the worker doesn't spawn real CLI binaries
+    const { registerBackend } = await import("../../src/runners/registry.js");
+    registerBackend("cli-claude", createMockBackend("cli-claude", "mock output"));
     expect(capturedProcessor).not.toBeNull();
 
     const mockJob = {
@@ -692,18 +702,17 @@ describe("end-to-end pipeline", () => {
   it("processes trivial gate with mock cli-claude backend", async () => {
     await writeGateYaml("test-trivial.yaml", TEST_TRIVIAL_YAML);
 
-    // Register a mock claude backend before starting the app
+    app = await startApp({ gatesDir: tempDir });
+
+    // Register mock backend after startApp (which registers real ones)
     const { registerBackend, resetRegistry } = await import(
       "../../src/runners/registry.js"
     );
-    resetRegistry();
     const mockClaudeBackend = createMockBackend(
       "cli-claude",
       "Claude response: pipeline verified",
     );
     registerBackend("cli-claude", mockClaudeBackend);
-
-    app = await startApp({ gatesDir: tempDir });
     expect(capturedProcessor).not.toBeNull();
 
     // Create a job simulating the full pipeline
@@ -770,17 +779,17 @@ describe("end-to-end pipeline", () => {
   it("processes trivial gate with mock cli-codex backend", async () => {
     await writeGateYaml("test-codex.yaml", TEST_CODEX_YAML);
 
+    app = await startApp({ gatesDir: tempDir });
+
+    // Register mock backend after startApp (which registers real ones)
     const { registerBackend, resetRegistry } = await import(
       "../../src/runners/registry.js"
     );
-    resetRegistry();
     const mockCodexBackend = createMockBackend(
       "cli-codex",
       "Codex response: pipeline verified",
     );
     registerBackend("cli-codex", mockCodexBackend);
-
-    app = await startApp({ gatesDir: tempDir });
     expect(capturedProcessor).not.toBeNull();
 
     const mockJob = {
@@ -845,17 +854,17 @@ describe("end-to-end pipeline", () => {
   it("processes trivial gate with mock cli-gemini backend", async () => {
     await writeGateYaml("test-gemini.yaml", TEST_GEMINI_YAML);
 
+    app = await startApp({ gatesDir: tempDir });
+
+    // Register mock backend after startApp (which registers real ones)
     const { registerBackend, resetRegistry } = await import(
       "../../src/runners/registry.js"
     );
-    resetRegistry();
     const mockGeminiBackend = createMockBackend(
       "cli-gemini",
       "Gemini response: pipeline verified",
     );
     registerBackend("cli-gemini", mockGeminiBackend);
-
-    app = await startApp({ gatesDir: tempDir });
     expect(capturedProcessor).not.toBeNull();
 
     const mockJob = {

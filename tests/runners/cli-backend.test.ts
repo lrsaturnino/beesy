@@ -544,17 +544,15 @@ describe("prompt file writing", () => {
     expect(writeCallArgs.length).toBeGreaterThan(0);
   });
 
-  it("passes temp file path to CLI command arguments", async () => {
+  it("passes prompt content to CLI command arguments", async () => {
     const { process: mockProc, emitStdout, emitClose } = createMockProcess();
     setupSpawnMock(mockProc);
 
-    const capturedArgs: string[] = [];
     const adapter = {
       cliCommand: "claude",
       buildArgs: vi.fn().mockImplementation(
-        (_config: AgentConfig, promptFilePath: string) => {
-          capturedArgs.push(promptFilePath);
-          return ["--model", "test", "-p", promptFilePath];
+        (_config: AgentConfig, promptContent: string) => {
+          return ["--model", "test", "-p", promptContent];
         },
       ),
       captureMode: "stdout" as const,
@@ -567,10 +565,10 @@ describe("prompt file writing", () => {
     emitClose(0);
     await runPromise;
 
-    // The adapter's buildArgs should have been called with a prompt file path
+    // buildArgs should have been called with inline prompt content (a string)
     expect(adapter.buildArgs).toHaveBeenCalledWith(
       expect.any(Object),
-      expect.stringContaining("prompt"),
+      expect.any(String),
       expect.anything(),
     );
   });

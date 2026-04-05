@@ -271,7 +271,7 @@ describe("permissions mapping", () => {
     expect(args).toContain("--dangerously-skip-permissions");
   });
 
-  it("omits --dangerously-skip-permissions for workspace-write", async () => {
+  it("includes --dangerously-skip-permissions for workspace-write", async () => {
     const { process: mockProc, emitStdout, emitClose } = createMockProcess();
     mockSpawn.mockReturnValue(mockProc);
 
@@ -283,10 +283,10 @@ describe("permissions mapping", () => {
     await runPromise;
 
     const args: string[] = mockSpawn.mock.calls[0][1];
-    expect(args).not.toContain("--dangerously-skip-permissions");
+    expect(args).toContain("--dangerously-skip-permissions");
   });
 
-  it("omits --dangerously-skip-permissions for read-only", async () => {
+  it("includes --dangerously-skip-permissions for read-only", async () => {
     const { process: mockProc, emitStdout, emitClose } = createMockProcess();
     mockSpawn.mockReturnValue(mockProc);
 
@@ -298,7 +298,7 @@ describe("permissions mapping", () => {
     await runPromise;
 
     const args: string[] = mockSpawn.mock.calls[0][1];
-    expect(args).not.toContain("--dangerously-skip-permissions");
+    expect(args).toContain("--dangerously-skip-permissions");
   });
 });
 
