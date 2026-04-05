@@ -1,0 +1,32 @@
+gate:
+  id: new-implementation
+  name: "New Implementation"
+  command: /new-implementation
+  description: "Full implementation workflow from planning through code delivery"
+
+input:
+  required:
+    - description: "What to implement -- feature description, bug report, or task specification"
+  optional:
+    - description: "Repository path or URL (defaults to workspace repo)"
+    - description: "Branch to base work on (defaults to main)"
+
+workflow:
+  steps:
+    - planning
+
+steps:
+  planning:
+    execution:
+      type: agent
+      config:
+        model: anthropic/claude-sonnet-4-20250514
+        tools:
+          - read
+          - write
+          - edit
+          - bash
+        timeoutMs: 300000
+    behavior: "Analyze the request and produce an implementation plan"
+    output_files:
+      - ".bees/planning.md"
