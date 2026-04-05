@@ -18,6 +18,10 @@ import { executeTask } from "./executor/task-executor.js";
 import { runSubtask } from "./executor/subtask-dispatcher.js";
 import { runScript } from "./executor/script-runner.js";
 import { runTool } from "./executor/tool-runner.js";
+import { registerBackend } from "./runners/registry.js";
+import { ClaudeCLIBackend } from "./runners/cli-claude.js";
+import { CodexCLIBackend } from "./runners/cli-codex.js";
+import { GeminiCLIBackend } from "./runners/cli-gemini.js";
 
 import type { Config } from "./utils/config.js";
 import type { GateConfig } from "./gates/types.js";
@@ -195,10 +199,32 @@ function createMessageHandler(
  * @param options - Optional overrides for gates directory and config values
  * @returns An AppHandle with a shutdown method for graceful teardown
  */
+/**
+ * Boot the application when run directly (not imported as a module).
+ * Calls startApp() and keeps the process alive via the Slack Socket Mode
+ * connection and BullMQ worker event loop.
+ */
+const isMainModule =
+  import.meta.url === `file://${process.argv[1]}` ||
+  import.meta.url.endsWith("/dist/index.js");
+
+if (isMainModule) {
+  startApp().catch((err: unknown) => {
+    console.error("Fatal: failed to start application", err);
+    process.exit(1);
+  });
+}
+
 export async function startApp(options?: StartAppOptions): Promise<AppHandle> {
   const config = { ...loadConfig(), ...options?.config };
   const log = createLogger(config.logLevel);
   const gatesDir = options?.gatesDir ?? DEFAULT_GATES_DIR;
+
+  // Register real CLI backends (replacing default stubs)
+  registerBackend("cli-claude", new ClaudeCLIBackend());
+  registerBackend("cli-codex", new CodexCLIBackend());
+  registerBackend("cli-gemini", new GeminiCLIBackend());
+  log.info("CLI agent backends registered", { backends: ["cli-claude", "cli-codex", "cli-gemini"] });
 
   // Initialize the gate router (auto-discover YAML files)
   const router = await initRouter(gatesDir);
