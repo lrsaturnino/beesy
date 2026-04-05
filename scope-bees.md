@@ -1,11 +1,12 @@
-# Project Hive — Agent Orchestration Platform
+# Project Bees — Agent Orchestration Platform
 
-## Planning Document v3.3
+## Planning Document v3.4
 
-**Codename:** Hive
-**Date:** 2026-03-30
+**Codename:** Bees
+**Date:** 2026-04-05
 **Status:** Planning
 **Focus:** `/new-implementation` gate as primary workflow
+**Change log v3.4:** Agent-agnostic architecture — replaced pi-mono SDK dependency with pluggable CLI backend adapters (cli-claude, cli-codex, cli-gemini). Added AgentBackend interface, backend registry, per-step backend selection via gate YAML, CLI flag mapping reference, and SDK adapter extension path.
 
 ---
 
@@ -92,14 +93,17 @@ PENDING → ACTIVE → COMPLETED
 
 ### 1.5 Step Execution Types
 
-Not every subtask is a single pi-mono agent session. Subtasks are polymorphic — each step declares an **execution type** that the subtask runner dispatches to.
+Subtasks are polymorphic — each step declares an **execution type** that the subtask runner dispatches to.
 
 ```
 EXECUTION TYPES:
 
-agent   → Single pi-mono SDK session. One model, one prompt, one output.
+agent   → AI model session via a pluggable backend. The backend
+          determines how the model is invoked (CLI subprocess, SDK
+          call, or raw API). One model, one prompt, one output.
           Used for: planning, research, review — tasks where a single
           LLM call with tools is sufficient.
+          Backends: cli-claude, cli-codex, cli-gemini (+ future SDK adapters)
 
 script  → External process (Python/shell) that runs its own agent
           orchestration internally. Receives context via stdin JSON,
@@ -108,7 +112,7 @@ script  → External process (Python/shell) that runs its own agent
           Used for: batch implementation (existing TDD pipeline),
           knowledge base priming, ACP consensus harness.
 
-tool    → Direct TypeScript function call within the Hive process.
+tool    → Direct TypeScript function call within the Bees process.
           No subprocess, no agent. Pure logic.
           Used for: file format conversion, git operations,
           notification dispatch, validation checks.
@@ -120,13 +124,105 @@ The **task executor loop does not change** regardless of execution type. It's al
 async function runSubtask(subtask: Subtask, step: StepDefinition, context: StepContext): Promise<StepOutput> {
   switch (step.execution.type) {
     case "agent":
-      return await runAgentSession(step.execution.config, context);
+      const backend = resolveAgentBackend(step.execution.config.backend);
+      return await backend.run(step.execution.config, context);
     case "script":
       return await runScript(step.execution.command, step.execution.env, context);
     case "tool":
       return await runTool(step.execution.module, step.execution.function, context);
   }
 }
+```
+
+### 1.6 Agent-Agnostic Architecture
+
+Bees does **not** depend on any single AI agent SDK. Instead, the agent runner uses a **backend adapter pattern** that decouples orchestration from model execution.
+
+```
+                      AgentBackend interface
+                 run(config, context) → StepOutput
+                            │
+           ┌────────────────┼────────────────┐
+           │                │                │
+    ┌──────┴──────┐  ┌─────┴──────┐  ┌──────┴──────┐
+    │ CLIBackend  │  │ SDKBackend │  │ APIBackend  │
+    │             │  │            │  │             │
+    │ Spawns CLI  │  │ In-process │  │ Direct HTTP │
+    │ subprocess  │  │ SDK call   │  │ to model API│
+    │ (claude,    │  │ (future)   │  │ (future)    │
+    │  codex,     │  │            │  │             │
+    │  gemini)    │  │            │  │             │
+    └─────────────┘  └────────────┘  └─────────────┘
+```
+
+**Why CLI-first:**
+
+The CLI backend is the default and recommended starting point. It provides:
+
+1. **Agent agnosticism** — Any AI model that ships a CLI works: `claude`, `codex`, `gemini`, or future CLIs. No vendor lock-in.
+2. **Proven pattern** — The project already uses CLI-based model dispatch (see `cmd-call-model`) with file-based I/O, state flags, and background execution.
+3. **Unified subprocess model** — The `agent` runner uses the same subprocess infrastructure as the `script` runner, reducing code surface.
+4. **Zero SDK dependencies** — No `@anthropic-ai/sdk`, no `@mariozechner/pi-coding-agent`, no `openai`. Bees owns its orchestration fully.
+5. **Swap backends per step** — Gate YAML declares the backend per step. One workflow can use Claude for planning and Codex for implementation.
+
+**CLI Backend execution contract:**
+
+```
+INPUT:   Prompt written to temp file
+OUTPUT:  Model response captured from stdout → output file
+STATE:   Flag files (pending/completed/failed) for async tracking
+TIMEOUT: Process kill after configured timeoutMs
+EXIT 0:  Success — read output file
+EXIT !0: Failure — capture stderr for error context
+```
+
+**SDK Backend (future path):**
+
+When tighter integration is needed (streaming, in-process tool execution, multi-turn), an SDK adapter can be added without changing the dispatcher, gate YAML, or executor. The interface is the same — only the implementation changes:
+
+```typescript
+interface AgentBackend {
+  readonly name: string;
+  run(config: AgentConfig, context: StepContext): Promise<StepOutput>;
+}
+
+// CLI backend (default — ships with Bees)
+class CLIAgentBackend implements AgentBackend {
+  readonly name = "cli";
+  async run(config: AgentConfig, context: StepContext): Promise<StepOutput> {
+    // Write prompt to temp file
+    // Spawn CLI process (claude, codex, gemini)
+    // Wait for completion or timeout
+    // Read output file → StepOutput
+  }
+}
+
+// SDK backend (future — opt-in per step)
+class AnthropicSDKBackend implements AgentBackend {
+  readonly name = "anthropic-sdk";
+  async run(config: AgentConfig, context: StepContext): Promise<StepOutput> {
+    // Import @anthropic-ai/claude-agent-sdk
+    // Create session, execute, return StepOutput
+  }
+}
+```
+
+**Backend resolution:**
+
+```typescript
+function resolveAgentBackend(backend?: string): AgentBackend {
+  // Default: CLI backend based on model provider prefix
+  // Explicit: "cli-claude", "cli-codex", "cli-gemini", "anthropic-sdk", etc.
+  const registry: Record<string, AgentBackend> = {
+    "cli-claude": new CLIAgentBackend("claude"),
+    "cli-codex": new CLIAgentBackend("codex"),
+    "cli-gemini": new CLIAgentBackend("gemini"),
+    // Future: "anthropic-sdk": new AnthropicSDKBackend(),
+    // Future: "openai-sdk": new OpenAISDKBackend(),
+  };
+  return registry[backend ?? inferBackendFromModel(config.model)];
+}
+```
 ```
 
 **Script contract:**
@@ -182,10 +278,15 @@ EXIT 2  → Needs human input (pause)
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐          │
 │  │  agent   │  │  script  │  │   tool   │          │
 │  │          │  │          │  │          │          │
-│  │ pi-mono  │  │ Python/  │  │ TS func  │          │
-│  │ SDK      │  │ shell    │  │ in-proc  │          │
-│  │ session  │  │ process  │  │ call     │          │
-│  └──────────┘  └──────────┘  └──────────┘          │
+│  │ Backend  │  │ Python/  │  │ TS func  │          │
+│  │ Adapter  │  │ shell    │  │ in-proc  │          │
+│  │ (CLI/SDK)│  │ process  │  │ call     │          │
+│  └────┬─────┘  └──────────┘  └──────────┘          │
+│       │                                              │
+│       ├─ cli-claude  (claude CLI subprocess)         │
+│       ├─ cli-codex   (codex CLI subprocess)          │
+│       ├─ cli-gemini  (gemini CLI subprocess)         │
+│       └─ (future: SDK adapters)                      │
 │                     │                                │
 │                     │ (may spawn its own agents)     │
 │                     ▼                                │
@@ -213,8 +314,11 @@ name: "Planning File Check"
 execution:
   type: agent
   config:
+    # backend: cli-claude (auto-resolved from anthropic/ prefix)
     model: anthropic/claude-haiku-4-5
+    effort: min
     tools: [read]
+    permissions: read-only
     skills: []
     timeoutMs: 30000
 behavior: |
@@ -241,14 +345,15 @@ execution:
   type: agent
   config:
     model: anthropic/claude-sonnet-4-20250514
-    thinkingLevel: high
+    effort: high
     tools: [read, write, bash]
+    permissions: workspace-write
     skills: [tbtc-architecture, planning-format]
     timeoutMs: 300000
 behavior: |
   IF existing_plan == true:
     - Read the provided plan
-    - Restructure into Hive planning format
+    - Restructure into Bees planning format
     - Preserve all original intent
     - Flag ambiguities for step 3
 
@@ -256,12 +361,12 @@ behavior: |
     - Gather from the task description
     - Ask clarifying questions if critical info is missing
       (subtask → NEEDS_INPUT)
-    - Generate a complete plan in Hive format
+    - Generate a complete plan in Bees format
 
-  OUTPUT FILE: .hive/planning.md
+  OUTPUT FILE: .bees/planning.md
 ```
 
-**Hive Planning Format:**
+**Bees Planning Format:**
 
 ```markdown
 # Planning: [Title]
@@ -311,7 +416,9 @@ execution:
   type: agent
   config:
     model: anthropic/claude-sonnet-4-20250514
+    effort: high
     tools: [read, bash, grep, find]
+    permissions: read-only
     skills: [tbtc-architecture, git-archaeology]
     timeoutMs: 300000
 behavior: |
@@ -321,8 +428,8 @@ behavior: |
   4. PROPOSE definition of done
   5. PRESENT to user → subtask enters NEEDS_INPUT
 
-  OUTPUT FILE: .hive/solution-path.md
-  OUTPUT FILE: .hive/definition-of-done.md
+  OUTPUT FILE: .bees/solution-path.md
+  OUTPUT FILE: .bees/definition-of-done.md
 ```
 
 ### Step 4: Adjust Planning
@@ -335,7 +442,9 @@ execution:
   type: agent
   config:
     model: anthropic/claude-sonnet-4-20250514
+    effort: high
     tools: [read, write]
+    permissions: workspace-write
     skills: [planning-format]
     timeoutMs: 180000
 behavior: |
@@ -343,7 +452,7 @@ behavior: |
   Update planning.md with refined approach, updated files affected,
   adjusted definition of done. Mark plan as APPROVED.
 
-  OUTPUT FILE: .hive/planning.md (updated, APPROVED)
+  OUTPUT FILE: .bees/planning.md (updated, APPROVED)
 ```
 
 ### Step 5: Prime Codebase Structure
@@ -356,7 +465,9 @@ execution:
   type: agent
   config:
     model: anthropic/claude-sonnet-4-20250514
+    effort: high
     tools: [read, bash, grep, find, ls]
+    permissions: read-only
     skills: [tbtc-architecture]
     timeoutMs: 300000
 behavior: |
@@ -364,7 +475,7 @@ behavior: |
   2. DOCUMENT current state (file tree, key functions, data flows)
   3. IDENTIFY constraints (Solidity version, storage layout, gas paths)
 
-  OUTPUT FILE: .hive/codebase-context.md
+  OUTPUT FILE: .bees/codebase-context.md
 ```
 
 ### Step 6: Prime Knowledge Base
@@ -380,10 +491,10 @@ execution:
     ANTHROPIC_API_KEY: "{{env.ANTHROPIC_API_KEY}}"
   timeoutMs: 300000
 input_files:
-  - .hive/planning.md
-  - .hive/codebase-context.md
+  - .bees/planning.md
+  - .bees/codebase-context.md
 output_files:
-  - .hive/knowledge-context.md
+  - .bees/knowledge-context.md
 behavior: |
   Python script that runs its own agent pipeline internally:
   1. Classify which knowledge domains are relevant (Haiku, cheap)
@@ -393,7 +504,7 @@ behavior: |
   5. Compile into a single knowledge context file
 
   The script owns its own agent orchestration.
-  Hive only sees input files → output files.
+  Bees only sees input files → output files.
 ```
 
 ### Step 7: Prime Guidelines
@@ -406,7 +517,9 @@ execution:
   type: agent
   config:
     model: anthropic/claude-haiku-4-5
+    effort: min
     tools: [read]
+    permissions: read-only
     skills: [solidity-patterns, foundry-tooling, tbtc-conventions]
     timeoutMs: 60000
 behavior: |
@@ -415,7 +528,7 @@ behavior: |
   2. Testing conventions (structure, patterns, fuzzing, fork tests)
   3. Commit and PR conventions
 
-  OUTPUT FILE: .hive/guidelines.md
+  OUTPUT FILE: .bees/guidelines.md
 ```
 
 ### Step 8: Create Implementation Tasks
@@ -428,8 +541,9 @@ execution:
   type: agent
   config:
     model: anthropic/claude-sonnet-4-20250514
-    thinkingLevel: high
+    effort: high
     tools: [read, write]
+    permissions: workspace-write
     skills: [planning-format, tbtc-architecture]
     timeoutMs: 300000
 behavior: |
@@ -440,7 +554,7 @@ behavior: |
   after this task alone), ordered (builds on previous), linked to
   acceptance criteria.
 
-  OUTPUT FILE: .hive/implementation-tasks.md
+  OUTPUT FILE: .bees/implementation-tasks.md
   → Present to user for approval → subtask enters NEEDS_INPUT
 ```
 
@@ -454,26 +568,26 @@ id: batch_implement
 name: "Batch Implement"
 execution:
   type: script
-  command: "python scripts/hive_batch_bridge.py"
+  command: "python scripts/bees_batch_bridge.py"
   env:
     ANTHROPIC_API_KEY: "{{env.ANTHROPIC_API_KEY}}"
   timeoutMs: 3600000  # 60 min
 input_files:
-  - .hive/implementation-tasks.md
-  - .hive/codebase-context.md
-  - .hive/knowledge-context.md
-  - .hive/guidelines.md
+  - .bees/implementation-tasks.md
+  - .bees/codebase-context.md
+  - .bees/knowledge-context.md
+  - .bees/guidelines.md
 output_files:
-  - .hive/implementation-log.md
+  - .bees/implementation-log.md
 ```
 
-**What happens inside `hive_batch_bridge.py`:**
+**What happens inside `bees_batch_bridge.py`:**
 
 ```
 ┌─────────────────────────────────────────────────┐
-│ hive_batch_bridge.py                             │
+│ bees_batch_bridge.py                             │
 │                                                  │
-│ 1. Read .hive/implementation-tasks.md            │
+│ 1. Read .bees/implementation-tasks.md            │
 │ 2. Convert to T-XXX.md files in MB format        │
 │    (Memory Bank task format with:                │
 │     Task ID, Status, Dependencies,               │
@@ -508,7 +622,7 @@ output_files:
 │    └──────────────────────────────┘              │
 │                                                  │
 │ 6. Collect results from task artifacts           │
-│ 7. Write .hive/implementation-log.md             │
+│ 7. Write .bees/implementation-log.md             │
 │ 8. Output JSON to stdout                         │
 └─────────────────────────────────────────────────┘
 ```
@@ -534,19 +648,21 @@ execution:
   type: agent
   config:
     model: anthropic/claude-sonnet-4-20250514
+    effort: high
     tools: [read, bash]
+    permissions: workspace-write
     skills: [tbtc-conventions, git-workflow]
     timeoutMs: 180000
 behavior: |
   1. Review implementation log
-  2. Stage changes (exclude .hive/ directory)
+  2. Stage changes (exclude .bees/ directory)
   3. Commit with conventional commit format
-     - Committer: hive-bot (configured in workspace git config)
+     - Committer: bees-bot (configured in workspace git config)
      - Add Co-authored-by trailer with requesting user's identity
      - Add Requested-by trailer with Slack context
-  4. Push to feature branch (hive/<task-id>-<slug>)
+  4. Push to feature branch (bees/<task-id>-<slug>)
   5. Draft PR via gh CLI or GitHub API using GITHUB_TOKEN:
-     - Opened by: hive-bot
+     - Opened by: bees-bot
      - Title: conventional format matching main commit
      - Body: summary, acceptance criteria checklist, test results,
        cost, link to Slack thread
@@ -601,12 +717,26 @@ steps:                                   # REQUIRED — step definitions, keyed 
 
       # ── IF type: agent ──
       config:                            # REQUIRED for agent type
+        backend: string                  # OPTIONAL — agent backend adapter.
+                                         #   Default: auto-resolved from model provider prefix.
+                                         #   CLI backends: cli-claude, cli-codex, cli-gemini
+                                         #   Future SDK backends: anthropic-sdk, openai-sdk
+                                         #   If omitted, "anthropic/*" → cli-claude, "openai/*" → cli-codex, etc.
         model: string                    # REQUIRED — provider/model-id (e.g., anthropic/claude-sonnet-4-20250514)
-        thinkingLevel: string            # OPTIONAL — off, minimal, low, medium, high, xhigh
+        effort: string                   # OPTIONAL — model effort level. Maps to CLI flags:
+                                         #   claude: --effort (min, low, medium, high, max)
+                                         #   codex: -c model_reasoning_effort= (low, medium, high, xhigh)
+                                         #   gemini: (not supported, ignored)
+                                         #   Default: high
         tools: [string]                  # REQUIRED — list of tools the agent can use
                                          #   built-in: read, write, edit, bash, grep, find, ls
+        permissions: string              # OPTIONAL — agent permission level.
+                                         #   "read-only" | "workspace-write" | "full-access"
+                                         #   Maps to CLI permission flags per backend.
+                                         #   Default: "workspace-write"
         skills: [string]                 # OPTIONAL — skill directory names to load from skills/
         systemPrompt: string             # OPTIONAL — override default system prompt
+        outputFormat: string             # OPTIONAL — "text" | "json". Default: "text"
         timeoutMs: number                # REQUIRED — max duration in milliseconds
 
       # ── IF type: script ──
@@ -622,7 +752,7 @@ steps:                                   # REQUIRED — step definitions, keyed 
         <key>: any
 
     input_files:                         # OPTIONAL — files this step reads from the workspace
-      - string                           #   relative to workspace root (e.g., .hive/planning.md)
+      - string                           #   relative to workspace root (e.g., .bees/planning.md)
     output_files:                        # OPTIONAL — files this step produces
       - string                           #   relative to workspace root
     behavior: |                          # OPTIONAL — human-readable description of what this step does
@@ -632,9 +762,9 @@ steps:                                   # REQUIRED — step definitions, keyed 
 
 workspace:                               # REQUIRED — workspace configuration for this gate
   repo: string                           # REQUIRED — GitHub org/repo (e.g., threshold-network/tbtc-v2)
-  branch_prefix: string                  # OPTIONAL — default: "hive/". Prefix for feature branches.
-  working_dir: string                    # OPTIONAL — default: ".hive/". Directory for artifacts.
-  git_identity:                          # OPTIONAL — overrides global hive-bot identity
+  branch_prefix: string                  # OPTIONAL — default: "bees/". Prefix for feature branches.
+  working_dir: string                    # OPTIONAL — default: ".bees/". Directory for artifacts.
+  git_identity:                          # OPTIONAL — overrides global bees-bot identity
     name: string                         #   git user.name for this workspace
     email: string                        #   git user.email for this workspace
     token_env: string                    #   env var name holding the GitHub PAT
@@ -651,23 +781,32 @@ workspace:                               # REQUIRED — workspace configuration 
 **`workflow.steps`** — Defines strict execution order. The executor iterates this list top-to-bottom. Every entry must have a matching key in `steps:`. No conditional branching — all steps run in order. If a step should sometimes be skipped, handle that inside the step's agent/script logic (output "nothing to do" and exit 0).
 
 **`workflow.human_checkpoints`** — Each checkpoint pauses execution after the named step completes. The `action` field determines the Slack UX:
-- `discuss_and_confirm`: Agent posts findings, user discusses in thread, sends `@hive continue`
+- `discuss_and_confirm`: Agent posts findings, user discusses in thread, sends `@bees continue`
 - `approve_or_adjust`: Agent posts a proposal with Approve/Adjust/Cancel buttons
 
 **`steps.<id>.execution.type`** — Determines which runner handles the step:
-- `agent`: Creates a pi-mono SDK session. The `config` block maps directly to `createAgentSession()` parameters.
+- `agent`: Dispatches to a pluggable agent backend. The `config.backend` field selects the adapter (default: auto-resolved from model provider prefix). CLI backends spawn the agent as a subprocess; SDK backends (future) call the SDK in-process.
 - `script`: Spawns a subprocess. Receives context via stdin JSON, returns results via stdout JSON, streams progress via stderr.
 - `tool`: Calls a TypeScript function in-process. No subprocess, no LLM. For pure logic like file conversion, validation, git operations.
 
-**`steps.<id>.execution.config.tools`** — Agent-type only. List of tool names the agent is allowed to use. Available built-in tools: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Custom tools registered in `src/agents/tools/` are also available by name.
+**`steps.<id>.execution.config.backend`** — Agent-type only. Selects the agent execution backend. Available backends:
+- `cli-claude`: Spawns `claude` CLI with `--dangerously-skip-permissions --model <model> --effort <effort> -p <prompt> --output-format <format>`. Default for `anthropic/*` models.
+- `cli-codex`: Spawns `codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --model <model> -c model_reasoning_effort=<effort>`. Default for `openai/*` models.
+- `cli-gemini`: Spawns `gemini --approval-mode=yolo --model <model> -p <prompt> --output-format <format>`. Default for `google/*` models.
+- Future: `anthropic-sdk`, `openai-sdk` — In-process SDK backends for tighter integration (streaming, multi-turn, programmatic tool use).
+If omitted, the backend is inferred from the model provider prefix (the part before `/`).
 
-**`steps.<id>.execution.config.skills`** — Agent-type only. List of skill directory names. The runner loads `skills/<name>/SKILL.md` and injects it into the agent's context. Skills are loaded on-demand, not upfront.
+**`steps.<id>.execution.config.tools`** — Agent-type only. List of tool names the agent is allowed to use. Available built-in tools: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. How tools are passed depends on the backend (CLI flags, SDK parameters, etc.).
+
+**`steps.<id>.execution.config.permissions`** — Agent-type only. Controls what the agent is allowed to do in the workspace. `"read-only"` limits to read operations, `"workspace-write"` allows file modifications within the workspace, `"full-access"` grants unrestricted access (use with caution). Maps to backend-specific permission flags.
+
+**`steps.<id>.execution.config.skills`** — Agent-type only. List of skill directory names. The runner loads `skills/<name>/SKILL.md` and injects it into the agent's prompt context. Skills are loaded on-demand, not upfront.
 
 **`steps.<id>.input_files` / `output_files`** — Declarative. The executor doesn't enforce these (the agent/script reads/writes files on its own). They serve two purposes: documentation (what flows between steps) and validation (the executor can warn if an expected input file doesn't exist before running a step).
 
 **`workspace.repo`** — The executor clones or creates a worktree from this repo when the task starts. All steps operate within this workspace.
 
-**`workspace.artifacts`** — Listed for documentation and cleanup. When the task completes, artifacts are archived. The `.hive/` directory (or `working_dir`) is excluded from git commits.
+**`workspace.artifacts`** — Listed for documentation and cleanup. When the task completes, artifacts are archived. The `.bees/` directory (or `working_dir`) is excluded from git commits.
 
 ### 4.3 Validation Rules
 
@@ -741,8 +880,11 @@ steps:
     execution:
       type: agent
       config:
+        # backend: cli-claude (auto-resolved from anthropic/ prefix)
         model: anthropic/claude-haiku-4-5
+        effort: min
         tools: [read]
+        permissions: read-only
         skills: []
         timeoutMs: 30000
 
@@ -751,8 +893,9 @@ steps:
       type: agent
       config:
         model: anthropic/claude-sonnet-4-20250514
-        thinkingLevel: high
+        effort: high
         tools: [read, write, bash]
+        permissions: workspace-write
         skills: [tbtc-architecture, planning-format]
         timeoutMs: 300000
 
@@ -761,7 +904,9 @@ steps:
       type: agent
       config:
         model: anthropic/claude-sonnet-4-20250514
+        effort: high
         tools: [read, bash, grep, find]
+        permissions: read-only
         skills: [tbtc-architecture, git-archaeology]
         timeoutMs: 300000
 
@@ -770,7 +915,9 @@ steps:
       type: agent
       config:
         model: anthropic/claude-sonnet-4-20250514
+        effort: high
         tools: [read, write]
+        permissions: workspace-write
         skills: [planning-format]
         timeoutMs: 180000
 
@@ -779,7 +926,9 @@ steps:
       type: agent
       config:
         model: anthropic/claude-sonnet-4-20250514
+        effort: high
         tools: [read, bash, grep, find, ls]
+        permissions: read-only
         skills: [tbtc-architecture]
         timeoutMs: 300000
 
@@ -790,15 +939,17 @@ steps:
       env:
         ANTHROPIC_API_KEY: "{{env.ANTHROPIC_API_KEY}}"
       timeoutMs: 300000
-    input_files: [.hive/planning.md, .hive/codebase-context.md]
-    output_files: [.hive/knowledge-context.md]
+    input_files: [.bees/planning.md, .bees/codebase-context.md]
+    output_files: [.bees/knowledge-context.md]
 
   prime_guidelines:
     execution:
       type: agent
       config:
         model: anthropic/claude-haiku-4-5
+        effort: min
         tools: [read]
+        permissions: read-only
         skills: [solidity-patterns, foundry-tooling, tbtc-conventions]
         timeoutMs: 60000
 
@@ -807,42 +958,45 @@ steps:
       type: agent
       config:
         model: anthropic/claude-sonnet-4-20250514
-        thinkingLevel: high
+        effort: high
         tools: [read, write]
+        permissions: workspace-write
         skills: [planning-format, tbtc-architecture]
         timeoutMs: 300000
 
   batch_implement:
     execution:
       type: script
-      command: "python scripts/hive_batch_bridge.py"
+      command: "python scripts/bees_batch_bridge.py"
       env:
         ANTHROPIC_API_KEY: "{{env.ANTHROPIC_API_KEY}}"
       timeoutMs: 3600000
     input_files:
-      - .hive/implementation-tasks.md
-      - .hive/codebase-context.md
-      - .hive/knowledge-context.md
-      - .hive/guidelines.md
+      - .bees/implementation-tasks.md
+      - .bees/codebase-context.md
+      - .bees/knowledge-context.md
+      - .bees/guidelines.md
     output_files:
-      - .hive/implementation-log.md
+      - .bees/implementation-log.md
 
   commit_and_pr:
     execution:
       type: agent
       config:
         model: anthropic/claude-sonnet-4-20250514
+        effort: high
         tools: [read, bash]
+        permissions: workspace-write
         skills: [tbtc-conventions, git-workflow]
         timeoutMs: 180000
 
 workspace:
   repo: "threshold-network/tbtc-v2"
-  branch_prefix: "hive/"
-  working_dir: ".hive/"
+  branch_prefix: "bees/"
+  working_dir: ".bees/"
   git_identity:
-    name: "hive-bot"
-    email: "hive@t-labs.dev"
+    name: "bees-bot"
+    email: "bees@t-labs.dev"
     token_env: "GITHUB_TOKEN"
   artifacts:
     - planning.md
@@ -884,7 +1038,9 @@ steps:
       type: agent
       config:
         model: anthropic/claude-sonnet-4-20250514
+        effort: high
         tools: [read, grep, find, ls, bash]
+        permissions: read-only
         skills: [tbtc-architecture]
         timeoutMs: 300000
     behavior: |
@@ -896,7 +1052,9 @@ steps:
       type: agent
       config:
         model: anthropic/claude-haiku-4-5
+        effort: min
         tools: [read]
+        permissions: read-only
         skills: []
         timeoutMs: 60000
     behavior: |
@@ -919,7 +1077,7 @@ To add a new gate (e.g., `/investigate-bug`):
            skills/forensics/SKILL.md             knowledge not covered by existing skills.
 3. CREATE  scripts/vuln_scanner.py            ← If needed. Only if a step is type: script.
 4. REGISTER /investigate-bug in Slack app     ← Required. One API call or dashboard click.
-5. RESTART Hive (or hot-reload)               ← Gate router discovers new YAML automatically.
+5. RESTART Bees (or hot-reload)               ← Gate router discovers new YAML automatically.
 ```
 
 **If the gate only uses `type: agent` steps with existing skills:** steps 2 and 3 are skipped. It's just the YAML file and the Slack registration.
@@ -970,16 +1128,16 @@ Each agent:
 
 **Task file format** (T-XXX.md) includes: Task ID, Status, Dependencies, Project Source Path, acceptance criteria, Required Files for Implementation (source code, test files, config, guidelines, knowledge).
 
-### 5.2 Bridge Script — `hive_batch_bridge.py`
+### 5.2 Bridge Script — `bees_batch_bridge.py`
 
-The bridge converts Hive's format to the existing pipeline's format and back.
+The bridge converts Bees's format to the existing pipeline's format and back.
 
 ```python
-"""Bridge between Hive's implementation-tasks.md and the existing
+"""Bridge between Bees's implementation-tasks.md and the existing
 Memory Bank TDD pipeline (run_batch.py + mb-dev-implement).
 
-Receives: Hive context via stdin JSON
-Produces: .hive/implementation-log.md
+Receives: Bees context via stdin JSON
+Produces: .bees/implementation-log.md
 Delegates: All actual implementation to the existing pipeline
 """
 
@@ -991,23 +1149,23 @@ from datetime import datetime, timezone
 def main():
     context = json.loads(sys.stdin.read())
     workspace = Path(context["workspace"])
-    hive_dir = workspace / ".hive"
+    bees_dir = workspace / ".bees"
 
-    # 1. Read Hive's task list
-    tasks_md = (hive_dir / "implementation-tasks.md").read_text()
-    codebase_ctx = (hive_dir / "codebase-context.md").read_text()
-    knowledge_ctx = (hive_dir / "knowledge-context.md").read_text()
-    guidelines = (hive_dir / "guidelines.md").read_text()
+    # 1. Read Bees's task list
+    tasks_md = (bees_dir / "implementation-tasks.md").read_text()
+    codebase_ctx = (bees_dir / "codebase-context.md").read_text()
+    knowledge_ctx = (bees_dir / "knowledge-context.md").read_text()
+    guidelines = (bees_dir / "guidelines.md").read_text()
 
     # 2. Set up Memory Bank TD structure
-    mb_path = workspace / ".hive" / "memory-bank"
+    mb_path = workspace / ".bees" / "memory-bank"
     td_number = 1
     td_path = mb_path / f"TD-{td_number}"
     tasks_dir = td_path / "tasks"
     tasks_dir.mkdir(parents=True, exist_ok=True)
 
     # 3. Write planning.md for the TD cycle
-    planning = (hive_dir / "planning.md").read_text()
+    planning = (bees_dir / "planning.md").read_text()
     (td_path / "planning.md").write_text(
         f"project_source_path: {workspace}\n\n{planning}"
     )
@@ -1031,20 +1189,20 @@ def main():
     print(f"[BRIDGE] Delegating {len(tasks)} tasks to run_batch.py", file=sys.stderr)
     result = subprocess.run(
         ["python", "scripts/mb-batch-implement/run_batch.py", str(tasks_dir)],
-        capture_output=False,  # Let stderr stream to Hive for progress
+        capture_output=False,  # Let stderr stream to Bees for progress
         text=True,
         timeout=3600,
-        env={**os.environ, "HIVE_MODE": "1"},
+        env={**os.environ, "BEES_MODE": "1"},
     )
 
     # 6. Collect results
     log = collect_results(tasks_dir, tasks)
-    (hive_dir / "implementation-log.md").write_text(log)
+    (bees_dir / "implementation-log.md").write_text(log)
 
-    # 7. Output to Hive
+    # 7. Output to Bees
     json.dump({
         "output": log[:2000],
-        "output_files": [".hive/implementation-log.md"],
+        "output_files": [".bees/implementation-log.md"],
         "cost": estimate_cost(tasks_dir),
     }, sys.stdout)
 
@@ -1083,7 +1241,7 @@ def format_task_file(task_id, task, project_source_path, dependencies, **ctx) ->
 
 ## Required Files for Implementation
 
-Extracted from Hive context — see .hive/ artifacts for full details.
+Extracted from Bees context — see .bees/ artifacts for full details.
 """
 
 
@@ -1114,16 +1272,26 @@ if __name__ == "__main__":
 ### 5.3 Migration Path
 
 **Path A — Now (zero rewrite):**
-Step 9 calls `hive_batch_bridge.py` which delegates to `run_batch.py` + `mb-dev-implement`. All existing agents, artifact files, TDD phases, and Telegram notifications work unchanged. Hive only wraps the outer loop.
+Step 9 calls `bees_batch_bridge.py` which delegates to `run_batch.py` + `mb-dev-implement`. All existing agents, artifact files, TDD phases, and Telegram notifications work unchanged. Bees only wraps the outer loop. Agent steps use CLI backends (`claude`, `codex`, `gemini` CLIs).
 
-**Path B — Later (when there's a reason):**
-Rewrite inner agents as pi-mono agent definitions. Benefits:
-- Multi-model support (Sonnet for GREEN, Opus for VALIDATION)
-- Streaming per-phase progress to Slack (instead of batch notification)
-- Cost tracking per agent call (not just per task)
-- Model rotation across tasks (Ralph-style multi-perspective passes)
+**Path B — Later (SDK adapters for tighter integration):**
+Add SDK backend adapters alongside the CLI backends. Benefits:
+- Streaming per-phase progress to Slack (instead of waiting for CLI to finish)
+- In-process tool execution (no CLI tool overhead)
+- Multi-turn conversations within a single step
+- Programmatic cost tracking per agent call (not just per task)
+- Model rotation across tasks (multi-perspective passes)
 
-**Trigger for Path B:** When you want Slack-level visibility into which TDD phase is running, or when you want to use non-Anthropic models for specific phases, or when per-phase cost tracking matters.
+**Path C — Later (multi-model per workflow):**
+Use different backends and providers per step within the same workflow. Example:
+- Steps 1, 7 (cheap/fast): `cli-gemini` with Gemini Flash
+- Steps 2-5, 8, 10 (quality): `cli-claude` with Claude Sonnet
+- Step 9 (batch implementation): unchanged script runner
+This is already supported by the gate YAML — just change `model` and optionally `backend` per step.
+
+**Trigger for Path B:** When you want Slack-level visibility into sub-step progress, or when CLI startup overhead becomes measurable for short-lived agent steps.
+
+**Trigger for Path C:** When cost optimization matters, or when specific models outperform others for certain task types (e.g., Codex for code generation, Claude for planning).
 
 ---
 
@@ -1131,20 +1299,20 @@ Rewrite inner agents as pi-mono agent definitions. Benefits:
 
 ### 6.1 Dedicated Machine User
 
-Hive operates under a dedicated GitHub machine user account, separate from any team member's personal account.
+Bees operates under a dedicated GitHub machine user account, separate from any team member's personal account.
 
 | Field | Value |
 |-------|-------|
-| Account name | `t-labs-hive` (or `hive-bot`) |
-| Email | `hive@t-labs.dev` (or shared alias) |
-| Org membership | Write access to repos Hive operates on |
+| Account name | `t-labs-bees` (or `bees-bot`) |
+| Email | `bees@t-labs.dev` (or shared alias) |
+| Org membership | Write access to repos Bees operates on |
 | Auth | Fine-grained PAT scoped to: `contents` (read/write), `pull_requests` (read/write) |
 | Token storage | `.env` as `GITHUB_TOKEN` |
 
 **Why a dedicated account:**
 - Commits clearly show "bot wrote this" vs. "human wrote this" in PR reviews
 - GitHub audit log separates bot actions from human actions
-- Multiple team members trigger Hive — their requests shouldn't commit under one person's name
+- Multiple team members trigger Bees — their requests shouldn't commit under one person's name
 - Token rotation doesn't break anyone's personal workflow
 
 ### 6.2 Git Configuration Per Workspace
@@ -1152,8 +1320,8 @@ Hive operates under a dedicated GitHub machine user account, separate from any t
 When the task executor creates a workspace (git worktree or clone), it configures the bot identity:
 
 ```bash
-git config user.name "hive-bot"
-git config user.email "hive@t-labs.dev"
+git config user.name "bees-bot"
+git config user.email "bees@t-labs.dev"
 ```
 
 This is set per-workspace (not global) so it doesn't affect any other git operations on the host.
@@ -1167,19 +1335,19 @@ feat(staking): add rewards calculation
 
 Implements staking rewards calculation per TIP-112.
 
-Requested-by: @leonardo via Hive
-Co-authored-by: Leonardo <leonardo@t-labs.dev>
+Requested-by: @leonardo via Bees
+Co-authored-by: Leonardo <leonardo@tnetworklabs.com>
 ```
 
-- **Committer:** `hive-bot` (who made the change)
+- **Committer:** `bees-bot` (who made the change)
 - **Co-author:** the requesting user (who asked for it)
 - GitHub renders both in the PR UI
 
-The requesting user's name and email are resolved from the `HiveUser` mapping (Slack user ID → GitHub identity).
+The requesting user's name and email are resolved from the `BeesUser` mapping (Slack user ID → GitHub identity).
 
 ### 6.4 PR Authorship
 
-PRs are opened by `hive-bot` via `gh pr create` (GitHub CLI) or the GitHub API using `GITHUB_TOKEN`. The PR body includes:
+PRs are opened by `bees-bot` via `gh pr create` (GitHub CLI) or the GitHub API using `GITHUB_TOKEN`. The PR body includes:
 - Which gate and task produced this PR
 - Who requested it and when
 - Summary of changes, acceptance criteria checklist, test results
@@ -1188,11 +1356,11 @@ PRs are opened by `hive-bot` via `gh pr create` (GitHub CLI) or the GitHub API u
 
 ### 6.5 Branch Naming
 
-Branches follow the pattern: `hive/<task-id>-<slugified-title>`
+Branches follow the pattern: `bees/<task-id>-<slugified-title>`
 
-Example: `hive/task-0042-balanceowner-redemption-fix`
+Example: `bees/task-0042-balanceowner-redemption-fix`
 
-The pre-implementer agent (in the existing TDD pipeline) also creates branches. To avoid conflicts, the bridge script passes the Hive branch name through to the pipeline so both layers agree on the branch.
+The pre-implementer agent (in the existing TDD pipeline) also creates branches. To avoid conflicts, the bridge script passes the Bees branch name through to the pipeline so both layers agree on the branch.
 
 ### 6.6 Token Rotation
 
@@ -1298,11 +1466,11 @@ interface CronJob {
 **Slack commands:**
 
 ```
-@hive cron add "0 9 * * MON" /investigate-bug "scan for new vulnerabilities in staking module"
-@hive cron add "0 6 * * *" /research-kb "generate daily summary of open PRs"
-@hive cron list
-@hive cron delete <id>
-@hive cron pause <id> / @hive cron resume <id>
+@bees cron add "0 9 * * MON" /investigate-bug "scan for new vulnerabilities in staking module"
+@bees cron add "0 6 * * *" /research-kb "generate daily summary of open PRs"
+@bees cron list
+@bees cron delete <id>
+@bees cron pause <id> / @bees cron resume <id>
 ```
 
 When a cron fires, it creates a Task with `cronJobId` set. The task enters the queue like any other.
@@ -1318,7 +1486,7 @@ When a cron fires, it creates a Task with `cronJobId` set. The task enters the q
 3. Queue is **blocked**
 4. Agent/script posts its question to the Slack thread
 5. User responds in thread
-6. User sends `@hive continue` or reacts with ✅ to resume
+6. User sends `@bees continue` or reacts with ✅ to resume
 7. Subtask resumes with captured conversation as additional context
 
 ### 9.2 Approval Checkpoints
@@ -1348,19 +1516,19 @@ If no human response within configurable window (default: 4 hours), the task aut
 ### 10.2 Management Commands
 
 ```
-@hive status                       → Queue overview
-@hive status <task-id>             → Task detail with subtask progress
-@hive queue                        → Full queue listing
-@hive cancel <task-id>             → Cancel a task
-@hive priority <task-id> <level>   → Change task priority
-@hive continue                     → Resume paused subtask (in thread)
-@hive pause                        → Manually pause active task
-@hive skip                         → Skip current subtask (in thread)
-@hive retry                        → Retry failed subtask (in thread)
-@hive cost                         → Cost report
-@hive cost <task-id>               → Cost breakdown for a task
-@hive cron <subcommand>            → Cron management
-@hive help                         → Command list
+@bees status                       → Queue overview
+@bees status <task-id>             → Task detail with subtask progress
+@bees queue                        → Full queue listing
+@bees cancel <task-id>             → Cancel a task
+@bees priority <task-id> <level>   → Change task priority
+@bees continue                     → Resume paused subtask (in thread)
+@bees pause                        → Manually pause active task
+@bees skip                         → Skip current subtask (in thread)
+@bees retry                        → Retry failed subtask (in thread)
+@bees cost                         → Cost report
+@bees cost <task-id>               → Cost breakdown for a task
+@bees cron <subcommand>            → Cron management
+@bees help                         → Command list
 ```
 
 ### 10.3 Notification Flow
@@ -1368,7 +1536,7 @@ If no human response within configurable window (default: 4 hours), the task aut
 Each task gets its own Slack thread:
 
 ```
-#hive-tasks channel:
+#bees-tasks channel:
 
 🆕 @leonardo submitted: "Implement balanceOwner redemption fix"
    Gate: /new-implementation | Priority: normal | Position: #1
@@ -1418,26 +1586,54 @@ Each task gets its own Slack thread:
 
 | Component | Technology | Why |
 |-----------|-----------|-----|
-| Runtime | Node.js 22+ (ESM) | pi-mono SDK requirement |
-| Agent engine | `@mariozechner/pi-coding-agent` SDK | Multi-model, extensible, proven |
+| Runtime | Node.js 22+ (ESM) | Native fetch, stable ESM, TypeScript-first tooling |
+| Agent execution | CLI backend adapters (no SDK dependency) | Agent-agnostic: `claude`, `codex`, `gemini` CLIs via subprocess. Zero vendor lock-in. |
+| Agent CLIs | `claude` (Anthropic), `codex` (OpenAI), `gemini` (Google) | Pre-installed on host. Each CLI handles its own auth, model access, and tool execution. |
 | Task queue | BullMQ + Redis | Priority queue, cron, rate limiting built-in |
 | Slack | `@slack/bolt` (Socket Mode) | No public URL needed |
 | Persistence | SQLite (`better-sqlite3`) | Tasks, crons, costs, user mappings |
 | Workflow defs | YAML files | Version-controlled, human-readable |
-| Agent skills | Markdown files (pi skill format) | Standard pi-mono format |
+| Agent skills | Markdown files | Injected into agent prompt context. Format: `skills/<name>/SKILL.md` |
 | Script runtime | Python 3.12+ (via `uv`) | Existing pipeline runs on Python |
 | Existing pipeline | `run_batch.py` + `mb-dev-implement` | Proven TDD 4-agent system |
-| Git identity | `hive-bot` GitHub machine user | Dedicated bot account for commits and PRs |
+| Git identity | `bees-bot` GitHub machine user | Dedicated bot account for commits and PRs |
 | GitHub CLI | `gh` | PR creation, label/reviewer assignment |
 | Process manager | PM2 or systemd | Keep the service running |
 | VPS | Single machine, 4 CPU / 8GB RAM | Redis + Node + agent sessions |
+
+### 11.1 Agent Backend CLI Reference
+
+Each CLI backend maps the gate YAML `config` fields to CLI-specific flags:
+
+| Config Field | `cli-claude` | `cli-codex` | `cli-gemini` |
+|-------------|-------------|------------|-------------|
+| `model` | `--model <model-id>` | `--model <model-id>` | `--model <model-id>` |
+| `effort` | `--effort <level>` | `-c model_reasoning_effort=<level>` | _(not supported)_ |
+| `permissions` | `--dangerously-skip-permissions` (full) or default (restricted) | `--dangerously-bypass-approvals-and-sandbox` (full) | `--approval-mode=yolo` (full) |
+| `outputFormat` | `--output-format text\|json` | `-o <file>` (file output) | `--output-format text` |
+| `systemPrompt` | Prepended to `-p` prompt | Prepended to stdin | Prepended to `-p` prompt |
+| `skills` | Loaded from `skills/<name>/SKILL.md`, appended to prompt | Same | Same |
+| Prompt delivery | `-p "$(cat <prompt-file>)"` | `< <prompt-file>` (stdin) | `-p "$(cat <prompt-file>)"` |
+| Output capture | stdout redirect to file | `-o <output-file>` | stdout redirect to file |
+| Timeout | `kill -TERM` after `timeoutMs` | Same | Same |
+| State tracking | Flag files: `pending-*.flag`, `completed-*.flag`, `failed-*.flag` | Same | Same |
+
+**Model ID normalization:**
+
+The gate YAML uses `provider/model-id` format (e.g., `anthropic/claude-sonnet-4-20250514`). The CLI backend strips the provider prefix and passes only the model ID to the CLI. If `backend` is explicitly set, the provider prefix is ignored for backend resolution.
+
+```
+anthropic/claude-sonnet-4-20250514  →  claude --model claude-sonnet-4-20250514
+openai/gpt-5.4                      →  codex --model gpt-5.4
+google/gemini-3.1-pro-preview       →  gemini --model gemini-3.1-pro-preview
+```
 
 ---
 
 ## 12. Project Structure
 
 ```
-hive/
+bees/
 ├── package.json
 ├── tsconfig.json
 ├── .env
@@ -1463,18 +1659,21 @@ hive/
 │   ├── executor/
 │   │   ├── task-executor.ts        # for-loop: dequeue → subtasks → run
 │   │   ├── subtask-dispatcher.ts   # Routes to agent/script/tool runner
-│   │   ├── agent-runner.ts         # Pi SDK session execution
 │   │   ├── script-runner.ts        # Subprocess execution (stdin/stdout/stderr)
 │   │   ├── tool-runner.ts          # In-process TS function calls
 │   │   ├── context-builder.ts      # Build prompt/stdin from prior outputs
 │   │   └── human-interaction.ts    # NEEDS_INPUT / approval handling
 │   │
-│   ├── agents/
-│   │   ├── session-factory.ts      # createAgentSession wrapper
-│   │   └── tools/                  # Custom pi-mono agent tools
-│   │       ├── git.ts
-│   │       ├── forge.ts
-│   │       └── notify.ts
+│   ├── runners/
+│   │   ├── types.ts                # AgentBackend interface, AgentConfig, registry
+│   │   ├── registry.ts             # Backend registry + resolution (model prefix → backend)
+│   │   ├── cli-backend.ts          # CLIAgentBackend: shared subprocess logic
+│   │   │                           #   Handles: prompt file I/O, process spawn,
+│   │   │                           #   timeout kill, output capture, state flags
+│   │   ├── cli-claude.ts           # Claude CLI specifics (flag mapping, env vars)
+│   │   ├── cli-codex.ts            # Codex CLI specifics (flag mapping, env vars)
+│   │   ├── cli-gemini.ts           # Gemini CLI specifics (flag mapping, env vars)
+│   │   └── prompt-builder.ts       # Assembles prompt: system + skills + context + user prompt
 │   │
 │   ├── persistence/
 │   │   ├── db.ts                   # SQLite setup + migrations
@@ -1487,7 +1686,7 @@ hive/
 │       └── config.ts
 │
 ├── scripts/                        # Script-type step implementations
-│   ├── hive_batch_bridge.py        # Bridge: Hive → existing TDD pipeline
+│   ├── bees_batch_bridge.py        # Bridge: Bees → existing TDD pipeline
 │   ├── prime_knowledge.py          # KB priming with internal agents
 │   ├── mb-batch-implement/         # Existing pipeline (copied/symlinked)
 │   │   ├── run_batch.py
@@ -1506,7 +1705,7 @@ hive/
 │   ├── support-ticket.yaml         # (stub)
 │   └── live-state.yaml             # (stub)
 │
-├── skills/                         # Pi-format skill files
+├── skills/                         # Skill files (markdown, injected into agent prompt)
 │   ├── tbtc-architecture/SKILL.md
 │   ├── tbtc-security/SKILL.md
 │   ├── tbtc-governance/SKILL.md
@@ -1530,27 +1729,30 @@ hive/
 ### Phase 1: Skeleton (Week 1)
 
 - [ ] Project scaffolding (Node.js, TS, ESM, BullMQ, Redis)
-- [ ] Create `hive-bot` GitHub machine user, add to org, generate PAT
+- [ ] Create `bees-bot` GitHub machine user, add to org, generate PAT
 - [ ] Slack Bolt adapter — receive messages, send replies
 - [ ] Gate router — parse `/new-implementation` command
 - [ ] Task queue — push/dequeue with priority, sequential execution
 - [ ] Task executor — for-loop through steps, generate subtask list
 - [ ] Subtask dispatcher — route to agent/script/tool runner
-- [ ] Agent runner — create pi SDK session, execute, return output
+- [ ] Agent backend adapter interface + registry (`src/runners/`)
+- [ ] CLI agent backends — cli-claude, cli-codex, cli-gemini (subprocess spawn, flag mapping, output capture)
+- [ ] Prompt builder — assemble system prompt + skills + context into prompt file
 - [ ] Script runner — subprocess with stdin/stdout/stderr contract
-- [ ] Workspace setup — git worktree creation with hive-bot identity
+- [ ] Tool runner — in-process TS function dispatch
+- [ ] Workspace setup — git worktree creation with bees-bot identity
 - [ ] Wire end to end: Slack → queue → single subtask → reply
-- [ ] Test with a trivial 1-step gate
+- [ ] Test with a trivial 1-step gate (each backend: claude, codex, gemini)
 
 ### Phase 2: /new-implementation Workflow (Weeks 2-3)
 
 - [ ] Implement steps 1-5, 7-8, 10 as agent subtasks
 - [ ] Implement step 6 (prime_knowledge) as script subtask
-- [ ] Build `hive_batch_bridge.py` for step 9
+- [ ] Build `bees_batch_bridge.py` for step 9
 - [ ] Copy/symlink existing pipeline (`run_batch.py` + agents)
 - [ ] Gate YAML config loading
 - [ ] Context passing between subtasks (output → next input)
-- [ ] Human interaction: NEEDS_INPUT, Slack thread capture, `@hive continue`
+- [ ] Human interaction: NEEDS_INPUT, Slack thread capture, `@bees continue`
 - [ ] Approval checkpoints with Slack interactive buttons
 - [ ] Pause/resume and queue blocking logic
 - [ ] Auto-timeout for paused tasks (4h)
@@ -1582,22 +1784,26 @@ hive/
 - [ ] Additional adapters (Telegram, Discord, email)
 - [ ] Memory bank harness gate
 - [ ] ACP consensus harness gate
-- [ ] Path B migration: rewrite inner agents to pi-mono (multi-model, streaming)
+- [ ] Path B: SDK backend adapters for streaming and in-process tool execution
+- [ ] Path C: Multi-model workflows (Gemini for cheap steps, Claude for quality, Codex for code)
 - [ ] Web dashboard for queue visualization
+- [ ] Custom CLI backend adapter for self-hosted models (Ollama, vLLM)
 
 ---
 
 ## 14. Open Decisions
 
-| # | Question | Options | Recommendation |
-|---|----------|---------|----------------|
-| 1 | Queue blocking on pause | Block vs. skip paused | Block initially, add timeout-skip later |
-| 2 | Workspace isolation | Shared repo vs. worktree | Worktree per task — avoids contention |
-| 3 | Approval UX | Buttons vs. text | Buttons (cleaner), text as fallback |
-| 4 | Context passing | Full output vs. summary | Full output, let agent filter |
-| 5 | Model per step | Fixed in YAML vs. dynamic | Fixed in YAML — deterministic |
-| 6 | Existing pipeline coupling | Symlink vs. copy vs. npm | Symlink for dev, copy for deploy |
-| 7 | Notification routing | Slack only vs. also Telegram | Slack only (Telegram via existing notify for pipeline) |
-| 8 | Bridge script format conversion | Strict T-XXX.md vs. simplified | Match existing format exactly to avoid pipeline changes |
-| 9 | Cost model | Pay-per-use vs. daily budget | Daily budget per team, alert at 80% |
-| 10 | GitHub auth | Machine user + PAT vs. GitHub App | PAT to start, GitHub App later for auto-rotation |
+| # | Question | Options | Recommendation | Status |
+|---|----------|---------|----------------|--------|
+| 1 | Queue blocking on pause | Block vs. skip paused | Block initially, add timeout-skip later | Open |
+| 2 | Workspace isolation | Shared repo vs. worktree | Worktree per task — avoids contention | Open |
+| 3 | Approval UX | Buttons vs. text | Buttons (cleaner), text as fallback | Open |
+| 4 | Context passing | Full output vs. summary | Full output, let agent filter | Open |
+| 5 | Model per step | Fixed in YAML vs. dynamic | Fixed in YAML — deterministic | Open |
+| 6 | Existing pipeline coupling | Symlink vs. copy vs. npm | Symlink for dev, copy for deploy | Open |
+| 7 | Notification routing | Slack only vs. also Telegram | Slack only (Telegram via existing notify for pipeline) | Open |
+| 8 | Bridge script format conversion | Strict T-XXX.md vs. simplified | Match existing format exactly to avoid pipeline changes | Open |
+| 9 | Cost model | Pay-per-use vs. daily budget | Daily budget per team, alert at 80% | Open |
+| 10 | GitHub auth | Machine user + PAT vs. GitHub App | PAT to start, GitHub App later for auto-rotation | Open |
+| 11 | Agent execution | pi-mono SDK vs. CLI backends vs. vendor SDK | **DECIDED: CLI backend adapters.** No SDK dependency. Spawn `claude`/`codex`/`gemini` CLIs as subprocesses. Proven by existing `cmd-call-model` pattern. SDK adapters can be added later as optional backends without changing the dispatcher or gate YAML. | **Resolved** |
+| 12 | Backend per step | Single backend vs. per-step backend | Per-step backend via YAML `config.backend` field. Default auto-resolved from model provider prefix. Enables multi-model workflows without code changes. | **Resolved** |
