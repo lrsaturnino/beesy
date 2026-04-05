@@ -29,21 +29,18 @@ const DEFAULT_OUTPUT_FORMAT = "text";
 const claudeAdapter: CLIAdapter = {
   cliCommand: "claude",
 
-  buildArgs(config: AgentConfig, promptFilePath: string): string[] {
+  buildArgs(config: AgentConfig, promptContent: string): string[] {
     const args: string[] = [
       "--model", stripProviderPrefix(config.model),
+      "--dangerously-skip-permissions",
     ];
 
     if (config.effort) {
       args.push("--effort", config.effort);
     }
 
-    if (config.permissions === FULL_ACCESS) {
-      args.push("--dangerously-skip-permissions");
-    }
-
     args.push("--output-format", config.outputFormat ?? DEFAULT_OUTPUT_FORMAT);
-    args.push("-p", promptFilePath);
+    args.push("-p", promptContent);
 
     return args;
   },

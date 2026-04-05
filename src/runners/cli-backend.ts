@@ -73,11 +73,11 @@ export interface CLIAdapter {
    * Build the argument array for the CLI command.
    *
    * @param config - Agent configuration with model, effort, permissions, etc.
-   * @param promptFilePath - Absolute path to the temp prompt file
+   * @param promptContent - The assembled prompt text to pass to the CLI
    * @param outputFilePath - Absolute path to the output file (used by codex)
    * @returns Array of CLI argument strings
    */
-  buildArgs(config: AgentConfig, promptFilePath: string, outputFilePath?: string): string[];
+  buildArgs(config: AgentConfig, promptContent: string, outputFilePath?: string): string[];
 
   /** How to capture output: "stdout" reads from process stdout, "file" reads from output file. */
   readonly captureMode: "stdout" | "file";
@@ -128,18 +128,19 @@ export class CLIAgentBackend implements AgentBackend {
     const tempDir = path.join(tmpdir(), `${TEMP_DIR_PREFIX}${runId}`);
     const paths = buildRunPaths(tempDir, runId, context.stepId);
 
-    const args = this.adapter.buildArgs(config, paths.prompt, paths.output);
-
     logger.info(`Spawning ${this.adapter.cliCommand} for step ${context.stepId}`, {
       backend: this.name,
       command: this.adapter.cliCommand,
       stepId: context.stepId,
     });
 
+    const promptContent = buildPromptContent(context);
+    const args = this.adapter.buildArgs(config, promptContent, paths.output);
+
     const childProcess = spawn(this.adapter.cliCommand, args, {
       cwd: tmpdir(),
       env: { ...process.env },
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["ignore", "pipe", "pipe"],
     });
 
     const setupPromise = writePromptAndPendingFlag(

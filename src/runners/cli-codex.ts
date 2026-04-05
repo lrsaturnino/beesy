@@ -27,7 +27,7 @@ const FULL_ACCESS = "full-access";
 const codexAdapter: CLIAdapter = {
   cliCommand: "codex",
 
-  buildArgs(config: AgentConfig, _promptFilePath: string, outputFilePath?: string): string[] {
+  buildArgs(config: AgentConfig, promptContent: string, outputFilePath?: string): string[] {
     const args: string[] = [
       "exec",
       "--model", stripProviderPrefix(config.model),
@@ -46,6 +46,9 @@ const codexAdapter: CLIAdapter = {
     if (outputFilePath) {
       args.push("-o", outputFilePath);
     }
+
+    // Prompt content as positional argument
+    args.push(promptContent);
 
     return args;
   },

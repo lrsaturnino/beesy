@@ -30,7 +30,7 @@ const APPROVAL_MODE_FLAG = "--approval-mode=yolo";
 const geminiAdapter: CLIAdapter = {
   cliCommand: "gemini",
 
-  buildArgs(config: AgentConfig, promptFilePath: string): string[] {
+  buildArgs(config: AgentConfig, promptContent: string): string[] {
     const args: string[] = [
       "--model", stripProviderPrefix(config.model),
       APPROVAL_MODE_FLAG,
@@ -40,7 +40,7 @@ const geminiAdapter: CLIAdapter = {
       args.push("--output-format", config.outputFormat);
     }
 
-    args.push("-p", promptFilePath);
+    args.push("-p", promptContent);
 
     return args;
   },
