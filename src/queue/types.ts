@@ -2,8 +2,9 @@
  * Task and subtask domain types for the queue system.
  *
  * Defines the core data model for tasks flowing through the Bees platform:
- * lifecycle statuses, priority levels, execution types, cost tracking,
- * and the Task/Subtask structures that represent queued work.
+ * lifecycle statuses, priority levels, execution types, subtask dispatch
+ * kinds, cost tracking, and the Task/Subtask structures that represent
+ * queued work for both gate-centric and recipe-driven workflows.
  *
  * @module queue/types
  */
@@ -15,6 +16,7 @@ export const TASK_STATUSES = [
   "queued",
   "active",
   "paused",
+  "waiting",
   "completed",
   "failed",
   "aborted",
@@ -52,6 +54,17 @@ export const EXECUTION_TYPES = ["agent", "script", "tool"] as const;
 
 /** Execution strategy union type for a subtask step. */
 export type ExecutionType = (typeof EXECUTION_TYPES)[number];
+
+/** Valid subtask kind identifiers for the queue dispatch system. */
+export const SUBTASK_KINDS = [
+  "orchestrator_eval",
+  "stage_agent_run",
+  "resume_after_input",
+  "script_run",
+] as const;
+
+/** Subtask kind union type derived from {@link SUBTASK_KINDS}. */
+export type SubtaskKind = (typeof SUBTASK_KINDS)[number];
 
 /** Tracks token usage and estimated cost for a task or subtask. */
 export interface CostAccumulator {
@@ -95,6 +108,17 @@ export interface Subtask {
   error?: string;
   /** Human input received at a checkpoint. */
   humanInput?: string;
+
+  // -- Recipe-oriented dispatch fields -----------------------------------------
+
+  /** Dispatch kind for the worker loop (undefined for gate-centric subtasks). */
+  kind?: SubtaskKind;
+  /** Recipe stage this subtask belongs to. */
+  stageId?: string;
+  /** Resolved input data for execution. */
+  payload?: Record<string, unknown>;
+  /** Artifact identifiers produced by this subtask. */
+  artifactIds?: string[];
 }
 
 /** A queued unit of work routed through a gate workflow. */
@@ -133,4 +157,33 @@ export interface Task {
   workspacePath?: string;
   /** Error message if task failed. */
   error?: string;
+
+  // -- Recipe-oriented orchestration fields ------------------------------------
+
+  /** Recipe that drives this task (undefined for gate-centric tasks). */
+  recipeId?: string;
+  /** Active recipe stage identifier. */
+  currentStageId?: string;
+  /** Currently executing subtask identifier. */
+  activeSubtaskId?: string;
+  /** Ordered queue of pending subtask identifiers. */
+  queuedSubtaskIds?: string[];
+  /** Artifact identifiers produced during this task. */
+  artifactIds?: string[];
+
+  /** When the task was paused. */
+  pausedAt?: Date;
+  /** When the task entered the waiting state. */
+  waitingSince?: Date;
+  /** Deadline for resume before the timeout action fires. */
+  resumeDeadlineAt?: Date;
+  /** Human-readable reason for the pause. */
+  pauseReason?: string;
+  /** Input captured during a resume from human interaction. */
+  capturedHumanContext?: string;
+
+  /** Per-stage retry counters keyed by stage identifier. */
+  stageRetryCount?: Record<string, number>;
+  /** Running count of orchestrator decisions for this task. */
+  totalActionCount?: number;
 }

@@ -51,14 +51,15 @@ describe("queue types", () => {
     expect(subtask.executionType).toBe("agent");
   });
 
-  it("exports TaskStatus union type with all six values", async () => {
+  it("exports TaskStatus union type with all seven values", async () => {
     const mod = await import("../src/queue/types.js");
     expect(mod.TASK_STATUSES).toBeDefined();
     const statuses = mod.TASK_STATUSES as readonly string[];
-    expect(statuses).toHaveLength(6);
+    expect(statuses).toHaveLength(7);
     expect(statuses).toContain("queued");
     expect(statuses).toContain("active");
     expect(statuses).toContain("paused");
+    expect(statuses).toContain("waiting");
     expect(statuses).toContain("completed");
     expect(statuses).toContain("failed");
     expect(statuses).toContain("aborted");

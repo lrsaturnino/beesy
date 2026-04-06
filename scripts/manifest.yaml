@@ -1,0 +1,45 @@
+scripts:
+  - script_id: knowledge.prime
+    description: "Prime knowledge context from repository analysis"
+    runtime: python
+    path: scripts/knowledge/prime_knowledge.py
+    timeout_ms: 300000
+    retryable: true
+    side_effects: read-only
+    required_env:
+      - ANTHROPIC_API_KEY
+    orchestrator_notes: "Run early in a workflow to establish codebase context for downstream agents"
+    rerun_policy: restart
+
+  - script_id: implementation.batch_bridge
+    description: "Translate Bees planning artifacts into Memory Bank task packs"
+    runtime: python
+    path: scripts/implementation/bees_batch_bridge.py
+    timeout_ms: 120000
+    retryable: false
+    side_effects: workspace-write
+    required_env: []
+    orchestrator_notes: "Run after planning stage to generate task packs for external implementation pipeline"
+    rerun_policy: refuse
+
+  - script_id: monitoring.check_health
+    description: "Run health checks against target systems"
+    runtime: shell
+    path: scripts/monitoring/check_health.sh
+    timeout_ms: 60000
+    retryable: true
+    side_effects: read-only
+    required_env: []
+    orchestrator_notes: "Run in collect_data stage to gather health status"
+    rerun_policy: restart
+
+  - script_id: monitoring.aggregate_metrics
+    description: "Aggregate monitoring metrics from collected data"
+    runtime: shell
+    path: scripts/monitoring/aggregate_metrics.sh
+    timeout_ms: 60000
+    retryable: true
+    side_effects: read-only
+    required_env: []
+    orchestrator_notes: "Run in collect_data stage after health check to compile metrics"
+    rerun_policy: restart

@@ -1,0 +1,59 @@
+# Monitoring Pilot Recipe
+#
+# A script-heavy operational recipe demonstrating the script registry model.
+# The orchestrator coordinates two stages: data collection via shell scripts
+# and analysis via a stage agent. No bespoke executor code is required --
+# everything runs through the standard worker dispatch pipeline.
+
+recipe:
+  id: monitoring-pilot
+  name: "Monitoring Pilot"
+  command: /monitoring-pilot
+  description: "Script-heavy monitoring recipe validating the script registry model end-to-end"
+
+orchestrator:
+  role: roles/orchestrators/monitoring-pilot.md
+  backend: cli-claude
+  model: anthropic/claude-sonnet-4-20250514
+  effort: high
+  timeout_ms: 120000
+  max_stage_retries: 2
+  max_total_actions: 20
+
+stage_order:
+  - collect_data
+  - analyze
+
+start_stage: collect_data
+
+stages:
+  # Stage 1: Run monitoring scripts to gather health status and metrics.
+  # Both scripts are registered in the manifest and validated by the
+  # decision validator before execution.
+  collect_data:
+    role: roles/monitoring/collect-data.md
+    objective: "Collect health and metric data from target systems via scripts"
+    inputs:
+      - description: "Target system"
+        source: task.payload.target
+    outputs: []
+    allowed_transitions:
+      - analyze
+    allowed_scripts:
+      - monitoring.check_health
+      - monitoring.aggregate_metrics
+
+  # Stage 2: Analyze the collected data and produce a markdown report.
+  # No scripts are allowed in this stage -- analysis is handled by the
+  # stage agent which receives script outputs via input_patch injection.
+  analyze:
+    role: roles/monitoring/analyze.md
+    objective: "Analyze collected monitoring data and produce a report"
+    inputs:
+      - description: "Health data"
+        source: task.payload.health_summary
+    outputs:
+      - label: monitoring_report
+        format: md
+    allowed_transitions: []
+    allowed_scripts: []

@@ -19,6 +19,7 @@ import type {
   StepOutput,
 } from "../../src/runners/types.js";
 import type { Adapter } from "../../src/adapters/adapter.js";
+import type { ScriptManifest } from "../../src/scripts/types.js";
 
 // ---------------------------------------------------------------
 // Mock infrastructure: logger (suppress noise during tests)
@@ -133,6 +134,19 @@ vi.mock("bullmq", () => {
 
   return { Queue: MockQueue, Worker: MockWorker };
 });
+
+// ---------------------------------------------------------------
+// Mock infrastructure: script registry
+// ---------------------------------------------------------------
+
+const { mockLoadScriptRegistry } = vi.hoisted(() => ({
+  mockLoadScriptRegistry: vi.fn<[string, string], Promise<Map<string, ScriptManifest>>>()
+    .mockResolvedValue(new Map()),
+}));
+
+vi.mock("../../src/scripts/registry.js", () => ({
+  loadScriptRegistry: mockLoadScriptRegistry,
+}));
 
 // ---------------------------------------------------------------
 // Import module under test (only has a comment -- will fail)
@@ -269,6 +283,35 @@ function createMockBackend(
   };
 }
 
+/** Build a minimal valid ScriptManifest with overrides. */
+function makeScriptManifest(
+  id: string,
+  overrides?: Partial<ScriptManifest>,
+): ScriptManifest {
+  return {
+    script_id: id,
+    description: `Test script ${id}`,
+    runtime: "python",
+    path: `scripts/${id.replace(".", "/")}.py`,
+    timeout_ms: 30000,
+    retryable: false,
+    side_effects: "read-only",
+    required_env: [],
+    rerun_policy: "restart",
+    ...overrides,
+  };
+}
+
+/** Build a test registry Map with the given number of entries. */
+function makeTestRegistry(count: number = 2): Map<string, ScriptManifest> {
+  const registry = new Map<string, ScriptManifest>();
+  for (let i = 1; i <= count; i++) {
+    const id = `test.script_${i}`;
+    registry.set(id, makeScriptManifest(id));
+  }
+  return registry;
+}
+
 // ---------------------------------------------------------------
 // Test state management
 // ---------------------------------------------------------------
@@ -371,6 +414,178 @@ describe("startup sequence", () => {
 
     expect(sigTermCalls.length).toBeGreaterThanOrEqual(1);
     expect(sigIntCalls.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ---------------------------------------------------------------
+// Group 1b: Script Registry Wiring
+// ---------------------------------------------------------------
+
+describe("script registry wiring", () => {
+  it("startApp loads script registry at startup from manifest path", async () => {
+    await writeGateYaml("test-trivial.yaml", TEST_TRIVIAL_YAML);
+
+    const testRegistry = makeTestRegistry(2);
+
+    app = await startApp({
+      gatesDir: tempDir,
+      scriptRegistry: testRegistry,
+    });
+
+    // App should start successfully with the injected registry
+    expect(app).toBeDefined();
+    expect(app.shutdown).toBeInstanceOf(Function);
+
+    // A log entry should mention the script registry with the correct count
+    const registryLogCall = mockLogInfo.mock.calls.find(
+      (call: unknown[]) =>
+        typeof call[0] === "string" &&
+        /[Ss]cript.*regist/i.test(call[0] as string),
+    );
+    expect(registryLogCall).toBeDefined();
+    expect(registryLogCall![0]).toContain("2");
+  });
+
+  it("registry load failure prevents app startup with descriptive error", async () => {
+    await writeGateYaml("test-trivial.yaml", TEST_TRIVIAL_YAML);
+
+    // Configure mock to reject when loading from a nonexistent path
+    const badPath = "/tmp/nonexistent-manifest-path/manifest.yaml";
+    mockLoadScriptRegistry.mockRejectedValueOnce(
+      new Error(`ENOENT: no such file or directory, open '${badPath}'`),
+    );
+
+    await expect(
+      startApp({
+        gatesDir: tempDir,
+        manifestPath: badPath,
+      }),
+    ).rejects.toThrow();
+
+    // Worker processor should NOT have been created since startup failed
+    expect(capturedProcessor).toBeNull();
+  });
+
+  it("scriptRegistry override bypasses file loading", async () => {
+    await writeGateYaml("test-trivial.yaml", TEST_TRIVIAL_YAML);
+
+    const injectedRegistry = makeTestRegistry(1);
+    mockLoadScriptRegistry.mockClear();
+
+    app = await startApp({
+      gatesDir: tempDir,
+      scriptRegistry: injectedRegistry,
+    });
+
+    // App should start successfully
+    expect(app).toBeDefined();
+
+    // loadScriptRegistry should NOT have been called since override was provided
+    expect(mockLoadScriptRegistry).not.toHaveBeenCalled();
+  });
+
+  it("manifestPath override controls where registry is loaded from", async () => {
+    await writeGateYaml("test-trivial.yaml", TEST_TRIVIAL_YAML);
+
+    const customManifestPath = path.join(tempDir, "custom-manifest.yaml");
+    const customRegistry = makeTestRegistry(3);
+    mockLoadScriptRegistry.mockResolvedValueOnce(customRegistry);
+
+    app = await startApp({
+      gatesDir: tempDir,
+      manifestPath: customManifestPath,
+    });
+
+    // loadScriptRegistry should have been called with the custom path
+    expect(mockLoadScriptRegistry).toHaveBeenCalledWith(
+      customManifestPath,
+      expect.any(String),
+    );
+  });
+
+  it("registry is passed to worker processor and forwarded to runTask", async () => {
+    await writeGateYaml("test-trivial.yaml", TEST_TRIVIAL_YAML);
+
+    const testRegistry = makeTestRegistry(2);
+
+    app = await startApp({
+      gatesDir: tempDir,
+      scriptRegistry: testRegistry,
+    });
+
+    expect(capturedProcessor).not.toBeNull();
+
+    // Create a recipe-triggered job to exercise the runTask path
+    const mockJob = {
+      id: "job-registry-001",
+      data: {
+        id: "task-registry-001",
+        gate: "test-trivial",
+        status: "queued",
+        priority: "normal",
+        position: 0,
+        payload: { text: "test registry threading" },
+        requestedBy: "U456",
+        sourceChannel: {
+          platform: "slack",
+          channelId: "C-REGISTRY",
+        },
+        createdAt: new Date().toISOString(),
+        cost: makeCostAccumulator(),
+        recipeId: "test-recipe",
+        recipeConfig: {
+          recipe: {
+            id: "test-recipe",
+            name: "Test Recipe",
+            command: "/test-recipe",
+            description: "Test recipe for registry wiring",
+          },
+          stages: {},
+          start_stage: "init",
+        },
+      },
+    };
+
+    // Process the job -- runTask will be called with the registry
+    // If registry is not threaded through, script_run subtasks would fail
+    // with "Script registry not available"
+    await capturedProcessor!(mockJob);
+
+    // Verify no "Script registry not available" error was logged
+    const registryMissingLog = mockLogError.mock.calls.find(
+      (call: unknown[]) =>
+        typeof call[0] === "string" &&
+        (call[0] as string).includes("Script registry not available"),
+    );
+    expect(registryMissingLog).toBeUndefined();
+  });
+
+  it("log entry emitted on successful registry load with script count", async () => {
+    await writeGateYaml("test-trivial.yaml", TEST_TRIVIAL_YAML);
+
+    const testRegistry = makeTestRegistry(3);
+
+    app = await startApp({
+      gatesDir: tempDir,
+      scriptRegistry: testRegistry,
+    });
+
+    // Find the specific log entry about the script registry
+    const registryLogCall = mockLogInfo.mock.calls.find(
+      (call: unknown[]) =>
+        typeof call[0] === "string" &&
+        /[Ss]cript.*regist/i.test(call[0] as string),
+    );
+    expect(registryLogCall).toBeDefined();
+
+    // Verify the log message contains the script count (3)
+    const logMessage = registryLogCall![0] as string;
+    expect(logMessage).toMatch(/3/);
+
+    // Verify structured log data includes count and path info
+    const logData = registryLogCall![1] as Record<string, unknown>;
+    expect(logData).toBeDefined();
+    expect(logData.scriptCount).toBe(3);
   });
 });
 
