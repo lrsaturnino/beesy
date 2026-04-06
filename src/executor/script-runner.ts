@@ -172,11 +172,14 @@ function mapExitCodeToOutput(
  * process exit code to a uniform StepOutput.
  *
  * The primary 3-parameter signature matches the RunnerDeps.runScript interface.
- * An optional 4th parameter allows timeout override for testing.
+ * An optional 4th parameter accepts a callback invoked with each batch of
+ * stderr lines as they arrive. An optional 5th parameter allows timeout
+ * override for testing.
  *
  * @param command   - Shell command string to execute
  * @param env       - Environment variables for the subprocess (merged with process.env)
  * @param context   - Step execution context piped as JSON via stdin
+ * @param onStderr  - Optional callback invoked with stderr lines as they arrive
  * @param timeoutMs - Timeout in milliseconds (defaults to 300000)
  * @returns Uniform StepOutput with execution results
  */
@@ -184,6 +187,7 @@ export async function runScript(
   command: string,
   env: Record<string, string> | undefined,
   context: StepContext,
+  onStderr?: (lines: string[]) => void,
   timeoutMs: number = DEFAULT_SCRIPT_TIMEOUT_MS,
 ): Promise<StepOutput> {
   return new Promise<StepOutput>((resolve) => {
@@ -244,10 +248,13 @@ export async function runScript(
       stdoutChunks.push(chunk);
     });
 
-    // Collect stderr lines for diagnostic relay
+    // Collect stderr lines for diagnostic relay and forward to optional callback
     child.stderr.on("data", (chunk: Buffer) => {
       const lines = chunk.toString().split("\n").filter(Boolean);
       stderrLines.push(...lines);
+      if (onStderr) {
+        onStderr(lines);
+      }
     });
 
     // Handle process completion or termination

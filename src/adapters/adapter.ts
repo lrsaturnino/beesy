@@ -22,4 +22,9 @@ export interface Adapter {
   onMessage(callback: (message: NormalizedMessage) => void): void;
   /** Send a reply to a conversation channel or thread. */
   sendReply(channel: ChannelRef, text: string): Promise<void>;
+  /**
+   * Create a new conversation thread by posting an initial message.
+   * Returns the platform-specific thread identifier (e.g., Slack message ts).
+   */
+  createThread(channelId: string, text: string): Promise<string>;
 }

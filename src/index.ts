@@ -15,6 +15,7 @@ import { createSlackAdapter } from "./adapters/slack.js";
 import { initRouter } from "./gates/router.js";
 import { createTaskQueue } from "./queue/task-queue.js";
 import { executeTask } from "./executor/task-executor.js";
+import type { ProgressCallback, ProgressEvent } from "./executor/task-executor.js";
 import { runSubtask } from "./executor/subtask-dispatcher.js";
 import { runScript } from "./executor/script-runner.js";
 import { runTool } from "./executor/tool-runner.js";
@@ -86,7 +87,9 @@ function deserializeTask(data: Record<string, unknown>): Task {
  * @param task    - The executed task (carries status, error, and sourceChannel)
  */
 async function sendTaskResultReply(
-  adapter: { sendReply: (channel: Task["sourceChannel"], text: string) => Promise<void> },
+  adapter: {
+    sendReply: (channel: Task["sourceChannel"], text: string) => Promise<void>;
+  },
   task: Task,
 ): Promise<void> {
   if (task.status === "completed") {
@@ -102,20 +105,33 @@ async function sendTaskResultReply(
   }
 }
 
+/** Adapter capabilities required by the worker processor for thread creation and replies. */
+interface WorkerAdapterDeps {
+  sendReply: (channel: Task["sourceChannel"], text: string) => Promise<void>;
+  createThread: (channelId: string, text: string) => Promise<string>;
+}
+
 /**
  * Create the BullMQ worker processor callback.
  *
  * The processor deserializes the task from job data, extracts the embedded
- * GateConfig, builds the dispatch function binding RunnerDeps to runSubtask,
- * calls executeTask, and sends the result reply via the adapter.
+ * GateConfig, creates a Slack thread for the task, builds per-task runner
+ * dependencies with a stderr sink bound to that thread, constructs the
+ * dispatch function binding RunnerDeps to runSubtask, calls executeTask
+ * with progress reporting, and sends the result reply via the adapter.
  *
- * @param adapter - Slack adapter for sending completion/failure replies
- * @param runners - Injected runner dependencies for subtask dispatch
+ * Per-task runner construction creates a shallow copy of the shared runners
+ * with a `stderrSink` closure that routes script stderr to the task's
+ * Slack thread. Sink errors are caught and logged to prevent adapter
+ * failures from disrupting execution.
+ *
+ * @param adapter - Slack adapter for thread creation, progress, and result replies
+ * @param runners - Shared runner dependencies (copied per-task with stderrSink)
  * @param log     - Logger instance for structured error reporting
  * @returns Async processor function suitable for TaskQueue.startWorker
  */
 function createWorkerProcessor(
-  adapter: { sendReply: (channel: Task["sourceChannel"], text: string) => Promise<void> },
+  adapter: WorkerAdapterDeps,
   runners: RunnerDeps,
   log: ReturnType<typeof createLogger>,
 ): (job: Job) => Promise<void> {
@@ -124,14 +140,58 @@ function createWorkerProcessor(
     const task = deserializeTask(data);
     const gateConfig = data.gateConfig as GateConfig;
 
+    // Attempt to create a Slack thread for this task before execution begins.
+    // On success, overwrite task.sourceChannel so all downstream replies route
+    // to the thread. On failure, degrade to flat-channel posting.
+    try {
+      const threadTs = await adapter.createThread(
+        task.sourceChannel.channelId,
+        `Task ${task.id} queued for gate "${task.gate}".`,
+      );
+      task.sourceChannel = { ...task.sourceChannel, threadTs };
+    } catch (threadErr: unknown) {
+      log.warn("Thread creation failed, degrading to flat-channel posting", {
+        taskId: task.id,
+        channelId: task.sourceChannel.channelId,
+        error: extractErrorMessage(threadErr),
+      });
+    }
+
+    // Build per-task runners with stderrSink bound to the task's Slack thread.
+    // Errors from sendReply are caught and logged to prevent batcher failures
+    // from disrupting task execution.
+    const taskRunners: RunnerDeps = {
+      ...runners,
+      stderrSink: async (text: string): Promise<void> => {
+        try {
+          await adapter.sendReply(task.sourceChannel, text);
+        } catch (sinkErr: unknown) {
+          log.warn("stderr sink failed to send reply", {
+            taskId: task.id,
+            error: extractErrorMessage(sinkErr),
+          });
+        }
+      },
+    };
+
     const dispatch = (
       subtask: Parameters<typeof runSubtask>[0],
       step: Parameters<typeof runSubtask>[1],
       context: Parameters<typeof runSubtask>[2],
-    ): Promise<StepOutput> => runSubtask(subtask, step, context, runners);
+    ): Promise<StepOutput> => runSubtask(subtask, step, context, taskRunners);
+
+    const onProgress: ProgressCallback = (event: ProgressEvent) => {
+      const message = `Step ${event.stepIndex + 1}/${event.totalSteps}: ${event.stepName} (${event.executionType}) -- ${event.status}`;
+      void adapter.sendReply(task.sourceChannel, message).catch((err) => {
+        log.error("Failed to send progress notification", {
+          taskId: task.id,
+          error: extractErrorMessage(err),
+        });
+      });
+    };
 
     try {
-      const result = await executeTask(task, gateConfig, dispatch);
+      const result = await executeTask(task, gateConfig, dispatch, onProgress);
       await sendTaskResultReply(adapter, result);
     } catch (err: unknown) {
       const message = extractErrorMessage(err);

@@ -43,6 +43,8 @@ function makeSubtask(overrides: Partial<Subtask> = {}): Subtask {
       outputTokens: 0,
       estimatedCostUsd: 0,
     },
+    attempt: 1,
+    maxRetries: 0,
     ...overrides,
   };
 }
@@ -426,5 +428,177 @@ describe("error handling", () => {
         runners,
       ),
     ).rejects.toThrow("tool failed");
+  });
+});
+
+// ---------------------------------------------------------------
+// Group 6: Stderr Batcher Wiring
+// ---------------------------------------------------------------
+describe("stderr batcher wiring", () => {
+  it("creates batcher and passes push as onStderr for script steps when stderrSink is provided", async () => {
+    const runners = makeRunnerDeps({
+      stderrSink: vi.fn().mockResolvedValue(undefined),
+    } as Partial<RunnerDeps>);
+    const step = makeScriptStep({ command: "node script.js" });
+    const context = makeStepContext();
+
+    await runSubtask(
+      makeSubtask({ executionType: "script" }),
+      step,
+      context,
+      runners,
+    );
+
+    // The dispatcher should have called runScript with 4 args: command, env, context, onStderr callback
+    expect(runners.runScript).toHaveBeenCalledWith(
+      "node script.js",
+      undefined,
+      context,
+      expect.any(Function),
+    );
+  });
+
+  it("calls batcher.flush() after runScript resolves (sink receives accumulated lines)", async () => {
+    const stderrSink = vi.fn().mockResolvedValue(undefined);
+    // Mock runScript to simulate stderr callback invocation during execution
+    const mockRunScript = vi.fn().mockImplementation(
+      async (
+        _cmd: string,
+        _env: Record<string, string> | undefined,
+        _ctx: StepContext,
+        onStderr?: (lines: string[]) => void,
+      ) => {
+        // Simulate the script runner invoking onStderr with collected lines
+        if (onStderr) {
+          onStderr(["stderr-line-1", "stderr-line-2"]);
+        }
+        return makeStepOutput({ output: "script done" });
+      },
+    );
+
+    const runners = makeRunnerDeps({
+      runScript: mockRunScript,
+      stderrSink,
+    } as Partial<RunnerDeps>);
+    const step = makeScriptStep();
+
+    await runSubtask(
+      makeSubtask({ executionType: "script" }),
+      step,
+      makeStepContext(),
+      runners,
+    );
+
+    // After runSubtask resolves, flush should have sent accumulated lines to the sink
+    expect(stderrSink).toHaveBeenCalled();
+    const sinkText = stderrSink.mock.calls[0][0] as string;
+    expect(sinkText).toContain("stderr-line-1");
+    expect(sinkText).toContain("stderr-line-2");
+  });
+
+  it("does not create batcher for non-script steps even when stderrSink is provided", async () => {
+    const stderrSink = vi.fn().mockResolvedValue(undefined);
+
+    // Agent step
+    const agentBackend = makeStubBackend("cli-claude");
+    mockResolveAgentBackend.mockReturnValue(agentBackend);
+
+    const agentRunners = makeRunnerDeps({
+      stderrSink,
+    } as Partial<RunnerDeps>);
+
+    await runSubtask(
+      makeSubtask({ executionType: "agent" }),
+      makeAgentStep(),
+      makeStepContext(),
+      agentRunners,
+    );
+    expect(stderrSink).not.toHaveBeenCalled();
+
+    stderrSink.mockClear();
+
+    // Tool step
+    const toolRunners = makeRunnerDeps({
+      stderrSink,
+    } as Partial<RunnerDeps>);
+
+    await runSubtask(
+      makeSubtask({ executionType: "tool" }),
+      makeToolStep(),
+      makeStepContext(),
+      toolRunners,
+    );
+    expect(stderrSink).not.toHaveBeenCalled();
+  });
+
+  it("does not create batcher when stderrSink is undefined", async () => {
+    const runners = makeRunnerDeps();
+    const step = makeScriptStep({ command: "python3 run.py", env: { KEY: "val" } });
+    const context = makeStepContext();
+
+    await runSubtask(
+      makeSubtask({ executionType: "script" }),
+      step,
+      context,
+      runners,
+    );
+
+    // Without stderrSink, runScript should be called with exactly 3 args (no onStderr)
+    expect(runners.runScript).toHaveBeenCalledWith("python3 run.py", { KEY: "val" }, context);
+  });
+
+  it("RunnerDeps type accepts optional stderrSink field", async () => {
+    // Verify RunnerDeps can be constructed with stderrSink
+    const withSink = makeRunnerDeps({
+      stderrSink: vi.fn().mockResolvedValue(undefined),
+    } as Partial<RunnerDeps>);
+    expect(withSink.stderrSink).toBeDefined();
+
+    // Verify RunnerDeps can be constructed without stderrSink
+    const withoutSink = makeRunnerDeps();
+    expect(withoutSink.stderrSink).toBeUndefined();
+
+    // Both should work with runSubtask
+    const backend = makeStubBackend("test");
+    mockResolveAgentBackend.mockReturnValue(backend);
+
+    await runSubtask(makeSubtask(), makeAgentStep(), makeStepContext(), withSink);
+    await runSubtask(makeSubtask(), makeAgentStep(), makeStepContext(), withoutSink);
+  });
+
+  it("batcher.dispose() is called for cleanup after script step completes", async () => {
+    const stderrSink = vi.fn().mockResolvedValue(undefined);
+    const mockRunScript = vi.fn().mockImplementation(
+      async (
+        _cmd: string,
+        _env: Record<string, string> | undefined,
+        _ctx: StepContext,
+        onStderr?: (lines: string[]) => void,
+      ) => {
+        if (onStderr) {
+          onStderr(["cleanup-test-line"]);
+        }
+        return makeStepOutput({ output: "done" });
+      },
+    );
+
+    const runners = makeRunnerDeps({
+      runScript: mockRunScript,
+      stderrSink,
+    } as Partial<RunnerDeps>);
+
+    const result = await runSubtask(
+      makeSubtask({ executionType: "script" }),
+      makeScriptStep(),
+      makeStepContext(),
+      runners,
+    );
+
+    // Dispose drains the buffer to the sink, so sink should be called with accumulated content
+    expect(stderrSink).toHaveBeenCalled();
+    const sinkText = stderrSink.mock.calls[0][0] as string;
+    expect(sinkText).toContain("cleanup-test-line");
+    // The function should resolve cleanly (no leaked timers)
+    expect(result.output).toBe("done");
   });
 });

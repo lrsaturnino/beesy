@@ -10,8 +10,10 @@
  * 1. Reads the gate workflow step list and generates an ordered Subtask array
  * 2. Iterates sequentially through subtasks (never parallel)
  * 3. Manages subtask status transitions: pending -> active -> completed/failed
- * 4. Calls the injected dispatch function for each subtask
- * 5. Marks the parent task completed or failed based on outcomes
+ * 4. Emits progress events at each transition via optional callback
+ * 5. Calls the injected dispatch function for each subtask
+ * 6. Accumulates successful step outputs for downstream step consumption
+ * 7. Marks the parent task completed or failed based on outcomes
  *
  * The executor contains zero LLM logic -- it is pure orchestration only.
  * The dispatch function is injected as a dependency, not imported directly,
@@ -21,11 +23,36 @@
  * @module executor/task-executor
  */
 
-import type { Task, Subtask } from "../queue/types.js";
+import type { Task, Subtask, ExecutionType } from "../queue/types.js";
 import type { GateConfig, StepDefinition } from "../gates/types.js";
 import type { StepContext, StepOutput } from "../runners/types.js";
 import { buildStepContext } from "./context-builder.js";
 import { createLogger } from "../utils/logger.js";
+
+/** Observable progress event emitted at each subtask lifecycle transition. */
+export interface ProgressEvent {
+  /** Parent task identifier. */
+  taskId: string;
+  /** Zero-based index of the current step in the workflow. */
+  stepIndex: number;
+  /** Total number of steps in the workflow. */
+  totalSteps: number;
+  /** Human-readable step name. */
+  stepName: string;
+  /** How the step is executed (agent, script, or tool). */
+  executionType: ExecutionType;
+  /** Lifecycle transition that triggered this event. */
+  status: "started" | "completed" | "failed";
+  /** Error message when status is "failed". */
+  error?: string;
+  /** Elapsed time in milliseconds from activation to completion/failure. */
+  duration?: number;
+  /** Current execution attempt (1-based). Present during retry-enabled steps. */
+  attempt?: number;
+}
+
+/** Callback invoked by the executor at each subtask transition. */
+export type ProgressCallback = (event: ProgressEvent) => void;
 
 const logger = createLogger(process.env.LOG_LEVEL ?? "info");
 
@@ -77,6 +104,8 @@ function generateSubtasks(task: Task, gateConfig: GateConfig): Subtask[] {
       executionType: stepDef.execution.type,
       status: "pending" as const,
       cost: { ...ZERO_COST },
+      attempt: 1,
+      maxRetries: stepDef.retryPolicy?.maxRetries ?? 0,
     };
   });
 }
@@ -123,6 +152,24 @@ function failSubtask(subtask: Subtask, errorMessage: string): void {
 }
 
 /**
+ * Reset a subtask for a retry attempt after a failure.
+ *
+ * Clears the failure state (error, timestamps) and increments the attempt
+ * counter so the subtask can be re-dispatched. The cost accumulator is
+ * reset to zero since each attempt starts fresh.
+ *
+ * @param subtask - The failed subtask to reset for retry (mutated in place)
+ */
+function resetSubtaskForRetry(subtask: Subtask): void {
+  subtask.status = "pending";
+  subtask.error = undefined;
+  subtask.startedAt = undefined;
+  subtask.completedAt = undefined;
+  subtask.cost = { ...ZERO_COST };
+  subtask.attempt += 1;
+}
+
+/**
  * Finalize a task as failed after a subtask error.
  *
  * Sets the task status, records the error with the failing step ID
@@ -139,25 +186,132 @@ function failTask(task: Task, stepId: string, errorMessage: string): void {
 }
 
 /**
+ * Compute elapsed time in milliseconds between subtask activation and
+ * completion/failure. Returns undefined when either timestamp is absent
+ * (e.g., for "started" events where completedAt does not yet exist).
+ *
+ * @param subtask - The subtask whose timestamps to inspect
+ * @returns Elapsed milliseconds, or undefined if timestamps are incomplete
+ */
+function computeSubtaskDuration(subtask: Subtask): number | undefined {
+  if (subtask.completedAt && subtask.startedAt) {
+    return subtask.completedAt.getTime() - subtask.startedAt.getTime();
+  }
+  return undefined;
+}
+
+/**
+ * Fire a progress event through the callback with error isolation.
+ *
+ * Wraps every onProgress invocation in a try/catch so that a broken
+ * callback never crashes the executor loop. Errors are logged with
+ * enough context for diagnosis (task ID, step index, event status).
+ *
+ * @param onProgress - The callback to invoke (may be undefined, in which case this is a no-op)
+ * @param event      - The progress event to emit
+ */
+function emitProgress(
+  onProgress: ProgressCallback | undefined,
+  event: ProgressEvent,
+): void {
+  if (!onProgress) return;
+  try {
+    onProgress(event);
+  } catch (err) {
+    logger.error("Progress callback failed", {
+      taskId: event.taskId,
+      stepIndex: event.stepIndex,
+      status: event.status,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/** Possible outcomes from subtask failure handling within the retry loop. */
+type FailureAction = "retry" | "abort";
+
+/**
+ * Handle a subtask failure by recording the error, emitting a progress event,
+ * and deciding whether to retry or abort.
+ *
+ * Centralizes the failure handling logic shared by both the error-field path
+ * and the thrown-exception path, eliminating duplication in the retry loop.
+ *
+ * When retries remain (`attempt <= maxRetries`), the subtask is reset for
+ * another attempt and the function returns "retry". Otherwise it finalizes
+ * the task as failed and returns "abort".
+ *
+ * @param task         - The parent task (failed when retries are exhausted)
+ * @param subtask      - The subtask that failed (mutated in place)
+ * @param errorMessage - Descriptive error from the dispatch result or exception
+ * @param baseEvent    - Base progress event fields for this attempt
+ * @param onProgress   - Optional progress callback
+ * @returns "retry" if the subtask should be re-dispatched, "abort" if retries
+ *          are exhausted and the task has been finalized as failed
+ */
+function handleSubtaskFailure(
+  task: Task,
+  subtask: Subtask,
+  errorMessage: string,
+  baseEvent: Omit<ProgressEvent, "status" | "error" | "duration">,
+  onProgress: ProgressCallback | undefined,
+): FailureAction {
+  failSubtask(subtask, errorMessage);
+  emitProgress(onProgress, {
+    ...baseEvent,
+    status: "failed",
+    error: errorMessage,
+    duration: computeSubtaskDuration(subtask),
+  });
+
+  if (subtask.attempt <= subtask.maxRetries) {
+    logger.info("Retrying subtask", {
+      taskId: task.id,
+      subtaskId: subtask.id,
+      attempt: subtask.attempt,
+      maxRetries: subtask.maxRetries,
+    });
+    resetSubtaskForRetry(subtask);
+    return "retry";
+  }
+
+  failTask(task, subtask.stepId, errorMessage);
+  logger.error("Subtask failed permanently", {
+    taskId: task.id,
+    subtaskId: subtask.id,
+    error: errorMessage,
+  });
+  return "abort";
+}
+
+/**
  * Execute a task by iterating through its gate workflow steps sequentially.
  *
  * The task object is mutated in place (mutable state carrier pattern).
  * The returned task is the same object reference as the input, updated
  * with subtask results, status transitions, and timestamps.
  *
+ * Each successfully completed step's output is accumulated and passed to
+ * subsequent steps via {@link buildStepContext}, enabling multi-step data
+ * flow. Failed steps are excluded from the accumulated outputs map.
+ *
  * On failure, the executor stops iteration immediately. The failed subtask
  * receives an error field, remaining subtasks stay in "pending" status,
- * and the task is marked "failed". No retry logic is applied in TD-1.
+ * and the task is marked "failed".
  *
  * @param task       - The task to execute (mutated in place)
  * @param gateConfig - The gate configuration defining the workflow
  * @param dispatch   - Injected dispatch function for subtask execution
+ * @param onProgress - Optional callback invoked at each subtask lifecycle
+ *                     transition (started, completed, failed). Errors thrown
+ *                     by this callback are caught and logged, never propagated.
  * @returns The same task reference, updated with execution results
  */
 export async function executeTask(
   task: Task,
   gateConfig: GateConfig,
   dispatch: DispatchFn,
+  onProgress?: ProgressCallback,
 ): Promise<Task> {
   const subtasks = generateSubtasks(task, gateConfig);
   task.subtasks = subtasks;
@@ -183,54 +337,78 @@ export async function executeTask(
     subtaskCount: subtasks.length,
   });
 
+  const accumulatedOutputs: Record<string, StepOutput> = {};
+
   for (let i = 0; i < subtasks.length; i++) {
     const subtask = subtasks[i];
     task.currentSubtask = i;
-
-    activateSubtask(subtask);
-
-    const context = buildStepContext(task, gateConfig, subtask.stepId);
     const stepDef = gateConfig.steps[subtask.stepId];
 
-    logger.debug("Executing subtask", {
-      taskId: task.id,
-      subtaskId: subtask.id,
-      stepId: subtask.stepId,
-      executionType: subtask.executionType,
-    });
+    let subtaskCompleted = false;
 
-    try {
-      const output = await dispatch(subtask, stepDef, context);
+    // Safety guard: total attempts bounded by maxRetries + 1
+    while (subtask.attempt <= subtask.maxRetries + 1) {
+      const baseEvent: Omit<ProgressEvent, "status" | "error" | "duration"> = {
+        taskId: task.id,
+        stepIndex: i,
+        totalSteps: subtasks.length,
+        stepName: subtask.name,
+        executionType: subtask.executionType,
+        attempt: subtask.attempt,
+      };
 
-      // Non-thrown failure signaled via StepOutput.error field
-      if (output.error) {
-        failSubtask(subtask, output.error);
-        failTask(task, subtask.stepId, output.error);
-        logger.error("Subtask failed with error in output", {
-          taskId: task.id,
-          subtaskId: subtask.id,
-          error: output.error,
-        });
-        return task;
-      }
+      activateSubtask(subtask);
+      emitProgress(onProgress, { ...baseEvent, status: "started" });
 
-      completeSubtask(subtask, output);
-      logger.debug("Subtask completed", {
+      // Context rebuilt each attempt so retries receive current accumulated state
+      const context = buildStepContext(task, gateConfig, subtask.stepId, accumulatedOutputs);
+
+      logger.debug("Dispatching subtask", {
         taskId: task.id,
         subtaskId: subtask.id,
         stepId: subtask.stepId,
+        executionType: subtask.executionType,
+        attempt: subtask.attempt,
+        maxRetries: subtask.maxRetries,
       });
-    } catch (err: unknown) {
-      const errorMessage =
-        err instanceof Error ? err.message : String(err);
 
-      failSubtask(subtask, errorMessage);
-      failTask(task, subtask.stepId, errorMessage);
-      logger.error("Subtask threw an exception", {
-        taskId: task.id,
-        subtaskId: subtask.id,
-        error: errorMessage,
-      });
+      try {
+        const output = await dispatch(subtask, stepDef, context);
+
+        if (output.error) {
+          const action = handleSubtaskFailure(task, subtask, output.error, baseEvent, onProgress);
+          if (action === "retry") continue;
+          return task;
+        }
+
+        completeSubtask(subtask, output);
+        accumulatedOutputs[subtask.stepId] = output;
+        emitProgress(onProgress, {
+          ...baseEvent,
+          status: "completed",
+          duration: computeSubtaskDuration(subtask),
+        });
+
+        logger.debug("Subtask completed", {
+          taskId: task.id,
+          subtaskId: subtask.id,
+          stepId: subtask.stepId,
+        });
+
+        subtaskCompleted = true;
+        break;
+      } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        const action = handleSubtaskFailure(task, subtask, errorMessage, baseEvent, onProgress);
+        if (action === "retry") continue;
+        return task;
+      }
+    }
+
+    // Safety guard: if the while condition terminated the loop without a
+    // successful dispatch or an explicit task failure, fail gracefully.
+    if (!subtaskCompleted) {
+      failTask(task, subtask.stepId, subtask.error ?? "Retry loop exhausted");
       return task;
     }
   }

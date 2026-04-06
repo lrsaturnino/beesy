@@ -2,8 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, writeFile, rm, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { loadGates } from "../../src/gates/loader.js";
-import type { LoadGatesResult } from "../../src/gates/loader.js";
+import { loadGates, interpolateEnvVars } from "../../src/gates/loader.js";
 
 // -------------------------------------------------------------------
 // Shared helpers and fixtures
@@ -181,6 +180,90 @@ steps:
         timeoutMs: 60000
 `;
 
+const VALID_RETRY_POLICY_YAML = `
+gate:
+  id: retry-gate
+  name: "Retry Gate"
+  command: /retry-gate
+  description: "Gate with retry policy on step"
+
+input:
+  required:
+    - description: "What to do"
+
+workflow:
+  steps:
+    - planning
+
+steps:
+  planning:
+    execution:
+      type: agent
+      config:
+        model: anthropic/claude-sonnet-4-20250514
+        tools:
+          - read
+        timeoutMs: 60000
+    retry_policy:
+      max_retries: 2
+`;
+
+const HIGH_RETRY_POLICY_YAML = `
+gate:
+  id: high-retry-gate
+  name: "High Retry Gate"
+  command: /high-retry-gate
+  description: "Gate with high retry count"
+
+input:
+  required:
+    - description: "What to do"
+
+workflow:
+  steps:
+    - planning
+
+steps:
+  planning:
+    execution:
+      type: agent
+      config:
+        model: anthropic/claude-sonnet-4-20250514
+        tools:
+          - read
+        timeoutMs: 60000
+    retry_policy:
+      max_retries: 5
+`;
+
+const BOUNDARY_RETRY_POLICY_YAML = `
+gate:
+  id: boundary-retry-gate
+  name: "Boundary Retry Gate"
+  command: /boundary-retry-gate
+  description: "Gate with boundary retry count"
+
+input:
+  required:
+    - description: "What to do"
+
+workflow:
+  steps:
+    - planning
+
+steps:
+  planning:
+    execution:
+      type: agent
+      config:
+        model: anthropic/claude-sonnet-4-20250514
+        tools:
+          - read
+        timeoutMs: 60000
+    retry_policy:
+      max_retries: 3
+`;
+
 // -------------------------------------------------------------------
 // Group 1: Happy Path
 // -------------------------------------------------------------------
@@ -265,6 +348,25 @@ describe("happy path", () => {
     const config = result.configs[0];
     expect(config.workspace).toBeUndefined();
     expect(config.workflow.humanCheckpoints).toBeUndefined();
+  });
+
+  it("parses gate YAML with retry_policy into retryPolicy", async () => {
+    await writeYaml("retry-gate.yaml", VALID_RETRY_POLICY_YAML);
+    const result = await loadGates(tempDir);
+
+    expect(result.errors).toHaveLength(0);
+    expect(result.configs).toHaveLength(1);
+    expect(result.configs[0].steps.planning.retryPolicy).toBeDefined();
+    expect(result.configs[0].steps.planning.retryPolicy?.maxRetries).toBe(2);
+  });
+
+  it("returns undefined retryPolicy when retry_policy is absent", async () => {
+    await writeYaml("minimal-gate.yaml", VALID_OPTIONAL_OMITTED_YAML);
+    const result = await loadGates(tempDir);
+
+    expect(result.errors).toHaveLength(0);
+    expect(result.configs).toHaveLength(1);
+    expect(result.configs[0].steps.work.retryPolicy).toBeUndefined();
   });
 });
 
@@ -1009,6 +1111,47 @@ steps:
     expect(result.warnings.length).toBeGreaterThanOrEqual(1);
     expect(result.warnings.some((w) => w.severity === "warning" && w.message.toLowerCase().includes("disabled"))).toBe(true);
   });
+
+  it("warns when retryPolicy.maxRetries exceeds 3", async () => {
+    await writeYaml("high-retry-gate.yaml", HIGH_RETRY_POLICY_YAML);
+    const result = await loadGates(tempDir);
+
+    expect(result.errors).toHaveLength(0);
+    expect(result.configs).toHaveLength(1);
+    expect(result.warnings.length).toBeGreaterThanOrEqual(1);
+    expect(
+      result.warnings.some(
+        (w) =>
+          w.severity === "warning" &&
+          w.message.includes("maxRetries") &&
+          w.message.includes("5"),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not warn when retryPolicy.maxRetries is 3 or less", async () => {
+    await writeYaml("boundary-retry-gate.yaml", BOUNDARY_RETRY_POLICY_YAML);
+    const result = await loadGates(tempDir);
+
+    expect(result.errors).toHaveLength(0);
+    expect(result.configs).toHaveLength(1);
+    const retryWarnings = result.warnings.filter(
+      (w) => w.message.includes("maxRetries") || w.message.includes("retry"),
+    );
+    expect(retryWarnings).toHaveLength(0);
+  });
+
+  it("does not warn on retry when retryPolicy is absent", async () => {
+    await writeYaml("test-gate.yaml", VALID_MINIMAL_AGENT_YAML);
+    const result = await loadGates(tempDir);
+
+    expect(result.errors).toHaveLength(0);
+    expect(result.configs).toHaveLength(1);
+    const retryWarnings = result.warnings.filter(
+      (w) => w.message.includes("retry"),
+    );
+    expect(retryWarnings).toHaveLength(0);
+  });
 });
 
 // -------------------------------------------------------------------
@@ -1064,5 +1207,387 @@ steps:
     // Should have at least: missing gate.id, missing command, empty steps
     expect(result.errors.length).toBeGreaterThanOrEqual(3);
     expect(result.configs).toHaveLength(0);
+  });
+});
+
+// -------------------------------------------------------------------
+// Group 6: Env Var Interpolation
+// -------------------------------------------------------------------
+
+/** Gate YAML with a script step that has {{env.VAR}} in its env map. */
+const SCRIPT_STEP_WITH_ENV_TEMPLATE_YAML = `
+gate:
+  id: env-gate
+  name: "Env Gate"
+  command: /env-gate
+  description: "Gate with env var interpolation"
+
+input:
+  required:
+    - description: "What to run"
+
+workflow:
+  steps:
+    - run-script
+
+steps:
+  run-script:
+    execution:
+      type: script
+      command: "node run.js"
+      env:
+        API_KEY: "{{env.TEST_API_KEY}}"
+      timeoutMs: 30000
+`;
+
+/** Gate YAML with multiple env vars, some templated and some plain. */
+const SCRIPT_STEP_MIXED_ENV_YAML = `
+gate:
+  id: mixed-env-gate
+  name: "Mixed Env Gate"
+  command: /mixed-env-gate
+  description: "Gate with mixed env values"
+
+input:
+  required:
+    - description: "What to run"
+
+workflow:
+  steps:
+    - run-script
+
+steps:
+  run-script:
+    execution:
+      type: script
+      command: "node run.js"
+      env:
+        API_KEY: "{{env.TEST_API_KEY}}"
+        DB_HOST: "{{env.TEST_DB_HOST}}"
+        NODE_ENV: "production"
+      timeoutMs: 30000
+`;
+
+/** Gate YAML with workspace.git_identity.token_env set to a template pattern. */
+const WORKSPACE_TOKEN_ENV_YAML = `
+gate:
+  id: token-gate
+  name: "Token Gate"
+  command: /token-gate
+  description: "Gate with workspace token_env"
+
+input:
+  required:
+    - description: "What to do"
+
+workflow:
+  steps:
+    - work
+
+steps:
+  work:
+    execution:
+      type: agent
+      config:
+        model: anthropic/claude-sonnet-4-20250514
+        tools:
+          - read
+        timeoutMs: 60000
+
+workspace:
+  repo: "test-org/test-repo"
+  git_identity:
+    name: "Bees Bot"
+    email: "bees@test.com"
+    token_env: "GITHUB_TOKEN"
+`;
+
+/** Gate YAML with {{env.VAR}} appearing in non-env fields (scoping test). */
+const TEMPLATE_IN_NON_ENV_FIELD_YAML = `
+gate:
+  id: scoping-gate
+  name: "Scoping Gate"
+  command: /scoping-gate
+  description: "Description with {{env.TEST_SCOPING_VAR}} template"
+
+input:
+  required:
+    - description: "What to run"
+
+workflow:
+  steps:
+    - run-script
+
+steps:
+  run-script:
+    behavior: "Runs with {{env.TEST_SCOPING_VAR}} in behavior"
+    execution:
+      type: script
+      command: "node run.js"
+      timeoutMs: 30000
+`;
+
+/**
+ * Run a callback with temporary process.env overrides, restoring original
+ * values (or deleting them) after the callback completes -- even on failure.
+ */
+async function withEnvVars(
+  overrides: Record<string, string | undefined>,
+  fn: () => Promise<void> | void,
+): Promise<void> {
+  const originals: Record<string, string | undefined> = {};
+  for (const key of Object.keys(overrides)) {
+    originals[key] = process.env[key];
+    const value = overrides[key];
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+  try {
+    await fn();
+  } finally {
+    for (const [key, original] of Object.entries(originals)) {
+      if (original === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = original;
+      }
+    }
+  }
+}
+
+describe("env var interpolation", () => {
+  it("resolves {{env.VAR}} in script step env values", async () => {
+    await withEnvVars({ TEST_API_KEY: "test-secret-key-123" }, async () => {
+      await writeYaml("env-gate.yaml", SCRIPT_STEP_WITH_ENV_TEMPLATE_YAML);
+      const result = await loadGates(tempDir);
+
+      expect(result.errors).toHaveLength(0);
+      expect(result.warnings).toHaveLength(0);
+      expect(result.configs).toHaveLength(1);
+      const step = result.configs[0].steps["run-script"];
+      expect(step.execution.type).toBe("script");
+      if (step.execution.type === "script") {
+        expect(step.execution.env).toBeDefined();
+        expect(step.execution.env!.API_KEY).toBe("test-secret-key-123");
+      }
+    });
+  });
+
+  it("produces error for missing env var in script step env", async () => {
+    await withEnvVars({ UNDEFINED_VAR_FOR_TEST: undefined }, async () => {
+      const yaml = `
+gate:
+  id: missing-env-gate
+  name: "Missing Env Gate"
+  command: /missing-env-gate
+  description: "Gate with missing env var"
+
+input:
+  required:
+    - description: "What to run"
+
+workflow:
+  steps:
+    - run-script
+
+steps:
+  run-script:
+    execution:
+      type: script
+      command: "node run.js"
+      env:
+        SECRET: "{{env.UNDEFINED_VAR_FOR_TEST}}"
+      timeoutMs: 30000
+`;
+      await writeYaml("missing-env.yaml", yaml);
+      const result = await loadGates(tempDir);
+
+      expect(result.configs).toHaveLength(0);
+      expect(result.errors.length).toBeGreaterThanOrEqual(1);
+      expect(
+        result.errors.some((e) => e.message.includes("UNDEFINED_VAR_FOR_TEST")),
+      ).toBe(true);
+    });
+  });
+
+  it("does NOT interpolate workspace.git_identity.token_env", async () => {
+    await withEnvVars({ GITHUB_TOKEN: "ghp_supersecrettoken123" }, async () => {
+      await writeYaml("token-gate.yaml", WORKSPACE_TOKEN_ENV_YAML);
+      const result = await loadGates(tempDir);
+
+      expect(result.configs).toHaveLength(1);
+      const config = result.configs[0];
+      expect(config.workspace).toBeDefined();
+      expect(config.workspace!.gitIdentity).toBeDefined();
+      // token_env must retain the env var NAME, not the resolved secret
+      expect(config.workspace!.gitIdentity!.tokenEnv).toBe("GITHUB_TOKEN");
+      expect(config.workspace!.gitIdentity!.tokenEnv).not.toBe(
+        "ghp_supersecrettoken123",
+      );
+    });
+  });
+
+  it("does NOT interpolate non-env fields like description or behavior", async () => {
+    await withEnvVars({ TEST_SCOPING_VAR: "should-not-appear" }, async () => {
+      await writeYaml("scoping-gate.yaml", TEMPLATE_IN_NON_ENV_FIELD_YAML);
+      const result = await loadGates(tempDir);
+
+      expect(result.configs).toHaveLength(1);
+      const config = result.configs[0];
+      // Description must retain the literal template string
+      expect(config.gate.description).toContain("{{env.TEST_SCOPING_VAR}}");
+      expect(config.gate.description).not.toContain("should-not-appear");
+      // Step behavior must retain the literal template string
+      const step = config.steps["run-script"];
+      expect(step.behavior).toContain("{{env.TEST_SCOPING_VAR}}");
+      expect(step.behavior).not.toContain("should-not-appear");
+    });
+  });
+
+  it("passes through config with no {{env}} templates unchanged", async () => {
+    await writeYaml("script-gate.yaml", VALID_SCRIPT_STEP_YAML);
+    const result = await loadGates(tempDir);
+
+    expect(result.errors).toHaveLength(0);
+    expect(result.configs).toHaveLength(1);
+    const step = result.configs[0].steps.validate;
+    expect(step.execution.type).toBe("script");
+    if (step.execution.type === "script") {
+      expect(step.execution.command).toBe("node scripts/validate.js");
+    }
+  });
+
+  it("resolves multiple {{env}} templates in different env keys", async () => {
+    await withEnvVars(
+      { TEST_API_KEY: "key-abc-123", TEST_DB_HOST: "db.example.com" },
+      async () => {
+        await writeYaml("mixed-env.yaml", SCRIPT_STEP_MIXED_ENV_YAML);
+        const result = await loadGates(tempDir);
+
+        expect(result.errors).toHaveLength(0);
+        expect(result.configs).toHaveLength(1);
+        const step = result.configs[0].steps["run-script"];
+        expect(step.execution.type).toBe("script");
+        if (step.execution.type === "script") {
+          expect(step.execution.env!.API_KEY).toBe("key-abc-123");
+          expect(step.execution.env!.DB_HOST).toBe("db.example.com");
+          expect(step.execution.env!.NODE_ENV).toBe("production");
+        }
+      },
+    );
+  });
+
+  it("handles mixed resolved and plain values in env map", async () => {
+    await withEnvVars(
+      { TEST_API_KEY: "resolved-value", TEST_DB_HOST: "db.local" },
+      async () => {
+        await writeYaml("mixed-env.yaml", SCRIPT_STEP_MIXED_ENV_YAML);
+        const result = await loadGates(tempDir);
+
+        expect(result.errors).toHaveLength(0);
+        expect(result.configs).toHaveLength(1);
+        const step = result.configs[0].steps["run-script"];
+        if (step.execution.type === "script") {
+          // Templated value should be resolved
+          expect(step.execution.env!.API_KEY).toBe("resolved-value");
+          // Plain value should remain unchanged
+          expect(step.execution.env!.NODE_ENV).toBe("production");
+        }
+      },
+    );
+  });
+
+  it("loads YAML file with env templates end-to-end", async () => {
+    await withEnvVars({ TEST_E2E_VAR: "end-to-end-value" }, async () => {
+      const yaml = `
+gate:
+  id: e2e-env-gate
+  name: "E2E Env Gate"
+  command: /e2e-env-gate
+  description: "Full pipeline with env interpolation"
+
+input:
+  required:
+    - description: "What to run"
+
+workflow:
+  steps:
+    - build
+    - deploy
+
+steps:
+  build:
+    execution:
+      type: script
+      command: "npm run build"
+      env:
+        BUILD_TOKEN: "{{env.TEST_E2E_VAR}}"
+      timeoutMs: 60000
+  deploy:
+    execution:
+      type: agent
+      config:
+        model: anthropic/claude-sonnet-4-20250514
+        tools:
+          - read
+          - write
+        timeoutMs: 120000
+`;
+      await writeYaml("e2e-env.yaml", yaml);
+      const result = await loadGates(tempDir);
+
+      expect(result.errors).toHaveLength(0);
+      expect(result.configs).toHaveLength(1);
+      const config = result.configs[0];
+      expect(config.gate.id).toBe("e2e-env-gate");
+      // Script step env should have resolved value
+      const buildStep = config.steps.build;
+      expect(buildStep.execution.type).toBe("script");
+      if (buildStep.execution.type === "script") {
+        expect(buildStep.execution.env!.BUILD_TOKEN).toBe("end-to-end-value");
+      }
+      // Agent step should be unaffected
+      const deployStep = config.steps.deploy;
+      expect(deployStep.execution.type).toBe("agent");
+    });
+  });
+
+  it("calls interpolateEnvVars directly on parsed YAML object", async () => {
+    await withEnvVars({ TEST_DIRECT_VAR: "direct-value" }, () => {
+      const parsed: Record<string, unknown> = {
+        steps: {
+          "run-script": {
+            execution: {
+              type: "script",
+              command: "node run.js",
+              env: {
+                MY_VAR: "{{env.TEST_DIRECT_VAR}}",
+                PLAIN: "no-template",
+              },
+              timeoutMs: 30000,
+            },
+          },
+        },
+      };
+
+      const { result, errors, warnings } = interpolateEnvVars(
+        parsed,
+        "test-file.yaml",
+      );
+
+      expect(errors).toHaveLength(0);
+      expect(warnings).toHaveLength(0);
+      const steps = result.steps as Record<string, Record<string, unknown>>;
+      const execution = steps["run-script"].execution as Record<
+        string,
+        unknown
+      >;
+      const env = execution.env as Record<string, string>;
+      expect(env.MY_VAR).toBe("direct-value");
+      expect(env.PLAIN).toBe("no-template");
+    });
   });
 });
