@@ -257,6 +257,9 @@ export function validateDecision(
   const completed = completedOutputLabels ?? new Set<string>();
 
   const violations = [
+    currentStage
+      ? null
+      : `Current stage '${currentStageId}' does not exist in recipe '${recipe.id}'`,
     checkTargetStagePresent(decision),
     checkTransitionLegality(decision, currentStageId, allowedTransitions),
     checkRetryBudget(decision, retryCounts, recipe.orchestrator.max_stage_retries),

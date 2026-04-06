@@ -261,6 +261,57 @@ function resolveScriptReferences(
 }
 
 // ---------------------------------------------------------------------------
+// Output content resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the content for a single declared output from the step result.
+ *
+ * Checks `stepOutput.outputFiles` for a file whose basename matches the
+ * output label and format (e.g., "planning_doc.md"), then falls back to a
+ * basename containing the label, and finally to `stepOutput.output` when
+ * no matching file is found. This ensures multi-output stages write
+ * distinct content per declared output when the agent produces labeled
+ * output files.
+ */
+async function resolveOutputContent(
+  output: StageOutput,
+  stepOutput: StepOutput,
+): Promise<string> {
+  if (!stepOutput.outputFiles || stepOutput.outputFiles.length === 0) {
+    return stepOutput.output;
+  }
+
+  const exactName = `${output.label}.${output.format}`;
+
+  // Prefer exact match on "<label>.<format>"
+  const exactMatch = stepOutput.outputFiles.find(
+    (f) => path.basename(f) === exactName,
+  );
+  if (exactMatch) {
+    try {
+      return await readFile(exactMatch, "utf-8");
+    } catch {
+      return stepOutput.output;
+    }
+  }
+
+  // Fall back to any file whose basename contains the label
+  const labelMatch = stepOutput.outputFiles.find((f) =>
+    path.basename(f).includes(output.label),
+  );
+  if (labelMatch) {
+    try {
+      return await readFile(labelMatch, "utf-8");
+    } catch {
+      return stepOutput.output;
+    }
+  }
+
+  return stepOutput.output;
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -446,7 +497,8 @@ export async function normalizeOutput(
     const artifactId = randomUUID();
     const filePath = path.join(artifactsDir, `${artifactId}.${output.format}`);
 
-    await writeFile(filePath, stepOutput.output, "utf-8");
+    const content = await resolveOutputContent(output, stepOutput);
+    await writeFile(filePath, content, "utf-8");
     artifactIds.push(artifactId);
 
     appendJournalEntry(runsDir, task.id, {
@@ -458,10 +510,21 @@ export async function normalizeOutput(
     });
 
     if (output.mirror_to && task.workspacePath) {
+      const workspaceRoot = path.resolve(task.workspacePath);
+
       for (const mirrorRelPath of output.mirror_to) {
-        const mirrorAbsPath = path.join(task.workspacePath, mirrorRelPath);
+        const mirrorAbsPath = path.resolve(task.workspacePath, mirrorRelPath);
+
+        // Reject paths that escape the workspace boundary
+        if (
+          mirrorAbsPath !== workspaceRoot &&
+          !mirrorAbsPath.startsWith(workspaceRoot + path.sep)
+        ) {
+          continue;
+        }
+
         await mkdir(path.dirname(mirrorAbsPath), { recursive: true });
-        await writeFile(mirrorAbsPath, stepOutput.output, "utf-8");
+        await writeFile(mirrorAbsPath, content, "utf-8");
       }
     }
   }
