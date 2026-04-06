@@ -8,6 +8,10 @@
  * - `"agent"` steps resolve a backend via the {@link resolveAgentBackend}
  *   registry and call `backend.run()`.
  * - `"script"` steps delegate to the injected `runScript` function.
+ *   When a {@link StderrBatcherSink} is provided via `RunnerDeps.stderrSink`,
+ *   the dispatcher owns the batcher lifecycle: it creates the batcher,
+ *   passes `batcher.push` as the `onStderr` callback to `runScript`,
+ *   flushes after completion, and disposes via `try/finally` for cleanup.
  * - `"tool"` steps delegate to the injected `runTool` function.
  *
  * Script and tool runners are injected via {@link RunnerDeps} rather than
@@ -24,6 +28,8 @@ import type { Subtask } from "../queue/types.js";
 import type { StepDefinition } from "../gates/types.js";
 import type { StepContext, StepOutput } from "../runners/types.js";
 import { resolveAgentBackend } from "../runners/registry.js";
+import { createStderrBatcher } from "../utils/stderr-batcher.js";
+import type { StderrBatcherSink } from "../utils/stderr-batcher.js";
 
 /**
  * Injected runner dependencies for script and tool execution.
@@ -37,15 +43,17 @@ export interface RunnerDeps {
   /**
    * Execute a shell command with optional environment variables.
    *
-   * @param command - Shell command string to execute
-   * @param env     - Environment variables for the subprocess (undefined if none)
-   * @param context - Shared step execution context
+   * @param command  - Shell command string to execute
+   * @param env      - Environment variables for the subprocess (undefined if none)
+   * @param context  - Shared step execution context
+   * @param onStderr - Optional callback invoked with stderr lines as they arrive
    * @returns Step output with captured stdout and produced file paths
    */
   runScript(
     command: string,
     env: Record<string, string> | undefined,
     context: StepContext,
+    onStderr?: (lines: string[]) => void,
   ): Promise<StepOutput>;
 
   /**
@@ -63,6 +71,14 @@ export interface RunnerDeps {
     args: Record<string, unknown> | undefined,
     context: StepContext,
   ): Promise<StepOutput>;
+
+  /**
+   * Optional async sink for forwarding stderr content to an external
+   * destination (e.g., Slack thread). When provided, the dispatcher creates
+   * a batcher for script steps that accumulates stderr lines and flushes
+   * them to this sink.
+   */
+  stderrSink?: StderrBatcherSink;
 }
 
 /**
@@ -71,6 +87,11 @@ export interface RunnerDeps {
  * Routes execution through a discriminated union switch on `step.execution.type`.
  * TypeScript narrows the execution object in each case branch, providing
  * type-safe access to execution-specific fields without assertions.
+ *
+ * For script steps, when `runners.stderrSink` is provided, the dispatcher
+ * creates a {@link StderrBatcher} to accumulate stderr lines and forward them
+ * to the sink. The batcher is disposed in a `finally` block to prevent
+ * interval timer leaks regardless of whether `runScript` succeeds or throws.
  *
  * The `_subtask` parameter carries runtime state (status, cost, timing) that
  * is not used for routing but exists in the signature for future extensions
@@ -97,6 +118,21 @@ export async function runSubtask(
     }
 
     case "script": {
+      if (runners.stderrSink) {
+        const batcher = createStderrBatcher(runners.stderrSink);
+        try {
+          const result = await runners.runScript(
+            execution.command,
+            execution.env,
+            context,
+            batcher.push,
+          );
+          await batcher.flush();
+          return result;
+        } finally {
+          await batcher.dispose();
+        }
+      }
       return runners.runScript(execution.command, execution.env, context);
     }
 

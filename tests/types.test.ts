@@ -43,6 +43,8 @@ describe("queue types", () => {
       executionType: "agent",
       status: "pending",
       cost: { totalTokens: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      attempt: 1,
+      maxRetries: 0,
     };
     expect(subtask.id).toBe("subtask-001");
     expect(subtask.stepId).toBe("planning");
@@ -125,8 +127,10 @@ describe("queue types", () => {
       executionType: "script",
       status: "active",
       cost: { totalTokens: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      attempt: 1,
+      maxRetries: 0,
     };
-    const requiredKeys = ["id", "stepId", "name", "executionType", "status", "cost"];
+    const requiredKeys = ["id", "stepId", "name", "executionType", "status", "cost", "attempt", "maxRetries"];
     for (const key of requiredKeys) {
       expect(subtask[key], `Subtask must have required field: ${key}`).toBeDefined();
     }

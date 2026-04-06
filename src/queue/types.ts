@@ -79,6 +79,10 @@ export interface Subtask {
   status: SubtaskStatus;
   /** Accumulated cost for this subtask. */
   cost: CostAccumulator;
+  /** Current execution attempt (1-based, incremented on retry). */
+  attempt: number;
+  /** Maximum number of retries from the step's retry policy (0 = no retries). */
+  maxRetries: number;
   /** When execution started (set on activation). */
   startedAt?: Date;
   /** When execution completed or failed. */

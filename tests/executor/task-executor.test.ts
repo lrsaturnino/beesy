@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { executeTask } from "../../src/executor/task-executor.js";
 import { buildStepContext } from "../../src/executor/context-builder.js";
 
+import type { ProgressEvent } from "../../src/executor/task-executor.js";
 import type { Task, Subtask, CostAccumulator } from "../../src/queue/types.js";
 import type {
   GateConfig,
@@ -48,7 +49,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
 function makeGateConfig(
   stepConfigs: Record<
     string,
-    { type: "agent" | "script" | "tool"; behavior?: string }
+    { type: "agent" | "script" | "tool"; behavior?: string; retryPolicy?: { maxRetries: number } }
   > = {
     "step-analyze": { type: "agent", behavior: "Analyze the codebase" },
     "step-implement": { type: "script", behavior: "Run implementation script" },
@@ -70,6 +71,7 @@ function makeGateConfig(
           },
         },
         behavior: config.behavior,
+        ...(config.retryPolicy && { retryPolicy: config.retryPolicy }),
       };
     } else if (config.type === "script") {
       steps[stepId] = {
@@ -79,6 +81,7 @@ function makeGateConfig(
           timeoutMs: 30000,
         },
         behavior: config.behavior,
+        ...(config.retryPolicy && { retryPolicy: config.retryPolicy }),
       };
     } else {
       steps[stepId] = {
@@ -88,6 +91,7 @@ function makeGateConfig(
           function: "validate",
         },
         behavior: config.behavior,
+        ...(config.retryPolicy && { retryPolicy: config.retryPolicy }),
       };
     }
   }
@@ -185,6 +189,76 @@ describe("context builder", () => {
     const context = buildStepContext(task, gateConfig, "step-one");
 
     expect(context.priorOutputs).toEqual({});
+  });
+
+  it("populates priorOutputs from accumulated outputs map", () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({ "step-one": { type: "agent" } });
+    const accumulatedOutputs: Record<string, StepOutput> = {
+      "step-a": makeStepOutput({ output: "result-a", outputFiles: [] }),
+    };
+
+    const context = buildStepContext(
+      task,
+      gateConfig,
+      "step-one",
+      accumulatedOutputs,
+    );
+
+    expect(context.priorOutputs).toEqual(accumulatedOutputs);
+    expect(Object.keys(context.priorOutputs)).toHaveLength(1);
+  });
+
+  it("populates priorOutputs with multiple entries from accumulated map", () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({ "step-c": { type: "tool" } });
+    const stepOutputA = makeStepOutput({
+      output: "analysis done",
+      outputFiles: ["a.md"],
+    });
+    const stepOutputB = makeStepOutput({
+      output: "implementation done",
+      outputFiles: ["b.ts"],
+    });
+    const accumulatedOutputs: Record<string, StepOutput> = {
+      "step-a": stepOutputA,
+      "step-b": stepOutputB,
+    };
+
+    const context = buildStepContext(
+      task,
+      gateConfig,
+      "step-c",
+      accumulatedOutputs,
+    );
+
+    expect(Object.keys(context.priorOutputs)).toHaveLength(2);
+    expect(context.priorOutputs["step-a"]).toEqual(stepOutputA);
+    expect(context.priorOutputs["step-b"]).toEqual(stepOutputB);
+  });
+
+  it("does not mutate the accumulated outputs map", () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({ "step-one": { type: "agent" } });
+    const accumulatedOutputs: Record<string, StepOutput> = {
+      "step-a": makeStepOutput({ output: "original" }),
+    };
+
+    const context = buildStepContext(
+      task,
+      gateConfig,
+      "step-one",
+      accumulatedOutputs,
+    );
+
+    // Mutate the returned priorOutputs
+    context.priorOutputs["step-injected"] = makeStepOutput({
+      output: "injected",
+    });
+
+    // Original map must remain unmodified
+    expect(accumulatedOutputs["step-injected"]).toBeUndefined();
+    expect(Object.keys(accumulatedOutputs)).toHaveLength(1);
   });
 });
 
@@ -791,5 +865,831 @@ describe("integration", () => {
 
     // Verify dispatcher was called exactly twice
     expect(dispatch).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---------------------------------------------------------------
+// Group 8: Output Accumulation
+// ---------------------------------------------------------------
+describe("output accumulation", () => {
+  it("passes empty priorOutputs to the first step", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-first": { type: "agent" },
+    });
+    const dispatch = makeDispatch();
+
+    await executeTask(task, gateConfig, dispatch);
+
+    const firstCtx = dispatch.mock.calls[0][2];
+    expect(firstCtx.priorOutputs).toEqual({});
+  });
+
+  it("accumulates outputs from completed steps across workflow", async () => {
+    const task = makeTask({ id: "task-accum" });
+    const gateConfig = makeGateConfig({
+      "step-analyze": { type: "agent" },
+      "step-implement": { type: "script" },
+      "step-validate": { type: "tool" },
+    });
+
+    const outputAnalyze = makeStepOutput({
+      output: "analysis result",
+      outputFiles: ["analysis.md"],
+    });
+    const outputImplement = makeStepOutput({
+      output: "implementation result",
+      outputFiles: ["impl.ts"],
+    });
+    const outputValidate = makeStepOutput({
+      output: "validation passed",
+      outputFiles: ["report.md"],
+    });
+
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >()
+      .mockResolvedValueOnce(outputAnalyze)
+      .mockResolvedValueOnce(outputImplement)
+      .mockResolvedValueOnce(outputValidate);
+
+    await executeTask(task, gateConfig, dispatch);
+
+    // Step 1: no prior outputs
+    const ctx1 = dispatch.mock.calls[0][2];
+    expect(ctx1.priorOutputs).toEqual({});
+
+    // Step 2: receives output from step 1
+    const ctx2 = dispatch.mock.calls[1][2];
+    expect(Object.keys(ctx2.priorOutputs)).toHaveLength(1);
+    expect(ctx2.priorOutputs["step-analyze"]).toEqual(outputAnalyze);
+
+    // Step 3: receives outputs from steps 1 and 2
+    const ctx3 = dispatch.mock.calls[2][2];
+    expect(Object.keys(ctx3.priorOutputs)).toHaveLength(2);
+    expect(ctx3.priorOutputs["step-analyze"]).toEqual(outputAnalyze);
+    expect(ctx3.priorOutputs["step-implement"]).toEqual(outputImplement);
+  });
+
+  it("does not accumulate outputs from steps that fail via error field", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent" },
+      "step-b": { type: "script" },
+      "step-c": { type: "tool" },
+    });
+
+    const outputA = makeStepOutput({ output: "step-a data" });
+    const outputB = makeStepOutput({ output: "", error: "step-b failed" });
+
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >()
+      .mockResolvedValueOnce(outputA)
+      .mockResolvedValueOnce(outputB);
+
+    const result = await executeTask(task, gateConfig, dispatch);
+
+    // Step 2 received step 1 output
+    const ctx2 = dispatch.mock.calls[1][2];
+    expect(Object.keys(ctx2.priorOutputs)).toHaveLength(1);
+    expect(ctx2.priorOutputs["step-a"]).toEqual(outputA);
+
+    // Task failed, step 3 never executed
+    expect(result.status).toBe("failed");
+    expect(dispatch).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not accumulate outputs from steps that throw exceptions", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent" },
+      "step-b": { type: "script" },
+      "step-c": { type: "tool" },
+    });
+
+    const outputA = makeStepOutput({ output: "step-a data" });
+
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >()
+      .mockResolvedValueOnce(outputA)
+      .mockRejectedValueOnce(new Error("process crashed"));
+
+    const result = await executeTask(task, gateConfig, dispatch);
+
+    // Step 2 received step 1 output
+    const ctx2 = dispatch.mock.calls[1][2];
+    expect(Object.keys(ctx2.priorOutputs)).toHaveLength(1);
+    expect(ctx2.priorOutputs["step-a"]).toEqual(outputA);
+
+    // Task failed, step 3 never executed
+    expect(result.status).toBe("failed");
+    expect(dispatch).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses stepId as key in accumulated outputs map", async () => {
+    const task = makeTask({ id: "task-key-check" });
+    const gateConfig = makeGateConfig({
+      "step-analyze": { type: "agent" },
+      "step-implement": { type: "script" },
+    });
+
+    const outputAnalyze = makeStepOutput({ output: "analysis" });
+
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >()
+      .mockResolvedValueOnce(outputAnalyze)
+      .mockResolvedValueOnce(makeStepOutput());
+
+    await executeTask(task, gateConfig, dispatch);
+
+    // The key should be the stepId, not the composite subtask id
+    const ctx2 = dispatch.mock.calls[1][2];
+    expect(Object.keys(ctx2.priorOutputs)).toEqual(["step-analyze"]);
+    // Verify the composite key is NOT used
+    expect(ctx2.priorOutputs["task-key-check-step-analyze"]).toBeUndefined();
+  });
+
+  it("accumulates the full StepOutput object including all fields", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-first": { type: "agent" },
+      "step-second": { type: "script" },
+    });
+
+    const fullOutput = makeStepOutput({
+      output: "detailed data",
+      outputFiles: ["file1.txt", "file2.txt"],
+      cost: {
+        totalTokens: 1500,
+        inputTokens: 1000,
+        outputTokens: 500,
+        estimatedCostUsd: 0.015,
+      },
+    });
+
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >()
+      .mockResolvedValueOnce(fullOutput)
+      .mockResolvedValueOnce(makeStepOutput());
+
+    await executeTask(task, gateConfig, dispatch);
+
+    const ctx2 = dispatch.mock.calls[1][2];
+    const accumulated = ctx2.priorOutputs["step-first"];
+
+    // Verify the full StepOutput is stored, not just the output string
+    expect(accumulated.output).toBe("detailed data");
+    expect(accumulated.outputFiles).toEqual(["file1.txt", "file2.txt"]);
+    expect(accumulated.cost).toEqual({
+      totalTokens: 1500,
+      inputTokens: 1000,
+      outputTokens: 500,
+      estimatedCostUsd: 0.015,
+    });
+  });
+});
+
+// ---------------------------------------------------------------
+// Group 9: Progress Notifications
+// ---------------------------------------------------------------
+describe("progress notifications", () => {
+  it("calls onProgress with started event after subtask activation", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-one": { type: "agent", behavior: "Analyze" },
+    });
+    const dispatch = makeDispatch();
+    const onProgress = vi.fn();
+
+    await executeTask(task, gateConfig, dispatch, onProgress);
+
+    expect(onProgress).toHaveBeenCalled();
+    const firstCall = onProgress.mock.calls[0][0] as ProgressEvent;
+    expect(firstCall.status).toBe("started");
+    expect(firstCall.stepIndex).toBe(0);
+    expect(firstCall.totalSteps).toBe(1);
+    expect(firstCall.stepName).toBe("Analyze");
+    expect(firstCall.executionType).toBe("agent");
+  });
+
+  it("calls onProgress with completed event after subtask completion", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-one": { type: "agent", behavior: "Analyze" },
+    });
+    const dispatch = makeDispatch();
+    const onProgress = vi.fn();
+
+    await executeTask(task, gateConfig, dispatch, onProgress);
+
+    expect(onProgress).toHaveBeenCalledTimes(2);
+    const secondCall = onProgress.mock.calls[1][0] as ProgressEvent;
+    expect(secondCall.status).toBe("completed");
+    expect(secondCall.stepIndex).toBe(0);
+    expect(typeof secondCall.duration).toBe("number");
+    expect(secondCall.duration).toBeGreaterThanOrEqual(0);
+  });
+
+  it("calls onProgress with failed event after subtask failure via error field", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-one": { type: "agent", behavior: "Analyze" },
+    });
+    const dispatch = makeDispatch().mockResolvedValue(
+      makeStepOutput({ error: "timeout" }),
+    );
+    const onProgress = vi.fn();
+
+    await executeTask(task, gateConfig, dispatch, onProgress);
+
+    const failedEvent = onProgress.mock.calls.find(
+      (call: unknown[]) => (call[0] as ProgressEvent).status === "failed",
+    );
+    expect(failedEvent).toBeDefined();
+    const event = failedEvent![0] as ProgressEvent;
+    expect(event.status).toBe("failed");
+    expect(event.error).toBe("timeout");
+  });
+
+  it("calls onProgress with failed event after subtask throws", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-one": { type: "agent", behavior: "Analyze" },
+    });
+    const dispatch = makeDispatch().mockRejectedValue(new Error("crash"));
+    const onProgress = vi.fn();
+
+    await executeTask(task, gateConfig, dispatch, onProgress);
+
+    const failedEvent = onProgress.mock.calls.find(
+      (call: unknown[]) => (call[0] as ProgressEvent).status === "failed",
+    );
+    expect(failedEvent).toBeDefined();
+    const event = failedEvent![0] as ProgressEvent;
+    expect(event.status).toBe("failed");
+    expect(event.error).toBe("crash");
+  });
+
+  it("emits correct sequence of events for multi-step execution", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-analyze": { type: "agent", behavior: "Analyze codebase" },
+      "step-implement": { type: "script", behavior: "Run implementation" },
+      "step-validate": { type: "tool", behavior: "Validate output" },
+    });
+    const dispatch = makeDispatch();
+    const onProgress = vi.fn();
+
+    await executeTask(task, gateConfig, dispatch, onProgress);
+
+    expect(onProgress).toHaveBeenCalledTimes(6);
+
+    const events = onProgress.mock.calls.map(
+      (call: unknown[]) => call[0] as ProgressEvent,
+    );
+
+    // Verify interleaved started/completed sequence
+    expect(events[0].status).toBe("started");
+    expect(events[0].stepIndex).toBe(0);
+    expect(events[0].stepName).toBe("Analyze codebase");
+    expect(events[0].executionType).toBe("agent");
+
+    expect(events[1].status).toBe("completed");
+    expect(events[1].stepIndex).toBe(0);
+
+    expect(events[2].status).toBe("started");
+    expect(events[2].stepIndex).toBe(1);
+    expect(events[2].stepName).toBe("Run implementation");
+    expect(events[2].executionType).toBe("script");
+
+    expect(events[3].status).toBe("completed");
+    expect(events[3].stepIndex).toBe(1);
+
+    expect(events[4].status).toBe("started");
+    expect(events[4].stepIndex).toBe(2);
+    expect(events[4].stepName).toBe("Validate output");
+    expect(events[4].executionType).toBe("tool");
+
+    expect(events[5].status).toBe("completed");
+    expect(events[5].stepIndex).toBe(2);
+
+    // All events should have totalSteps === 3
+    for (const event of events) {
+      expect(event.totalSteps).toBe(3);
+    }
+  });
+
+  it("emits started then failed for a step that fails mid-sequence", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", behavior: "First" },
+      "step-b": { type: "script", behavior: "Second" },
+      "step-c": { type: "tool", behavior: "Third" },
+    });
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >()
+      .mockResolvedValueOnce(makeStepOutput())
+      .mockResolvedValueOnce(makeStepOutput({ error: "step-b broke" }));
+    const onProgress = vi.fn();
+
+    await executeTask(task, gateConfig, dispatch, onProgress);
+
+    expect(onProgress).toHaveBeenCalledTimes(4);
+
+    const events = onProgress.mock.calls.map(
+      (call: unknown[]) => call[0] as ProgressEvent,
+    );
+
+    expect(events[0].status).toBe("started");
+    expect(events[0].stepIndex).toBe(0);
+    expect(events[1].status).toBe("completed");
+    expect(events[1].stepIndex).toBe(0);
+    expect(events[2].status).toBe("started");
+    expect(events[2].stepIndex).toBe(1);
+    expect(events[3].status).toBe("failed");
+    expect(events[3].stepIndex).toBe(1);
+
+    // No events for step 2 (index 2)
+    const step2Events = events.filter((e) => e.stepIndex === 2);
+    expect(step2Events).toHaveLength(0);
+  });
+
+  it("does not call onProgress when parameter is omitted", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent" },
+      "step-b": { type: "script" },
+      "step-c": { type: "tool" },
+    });
+    const dispatch = makeDispatch();
+
+    // Call with only 3 arguments (no onProgress)
+    const result = await executeTask(task, gateConfig, dispatch);
+
+    expect(result.status).toBe("completed");
+    expect(result.subtasks!.length).toBe(3);
+    for (const subtask of result.subtasks!) {
+      expect(subtask.status).toBe("completed");
+    }
+    expect(dispatch).toHaveBeenCalledTimes(3);
+  });
+
+  it("onProgress callback error does not crash executor", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", behavior: "First" },
+      "step-b": { type: "script", behavior: "Second" },
+    });
+    const dispatch = makeDispatch();
+    const onProgress = vi.fn()
+      .mockImplementationOnce(() => {
+        throw new Error("callback failed");
+      })
+      .mockImplementation(() => {
+        // Subsequent calls succeed
+      });
+
+    const result = await executeTask(task, gateConfig, dispatch, onProgress);
+
+    // Task must complete despite callback error
+    expect(result.status).toBe("completed");
+    // Both subtasks must complete
+    for (const subtask of result.subtasks!) {
+      expect(subtask.status).toBe("completed");
+    }
+    // onProgress should have been called for subsequent events despite first error
+    expect(onProgress.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it("ProgressEvent contains correct taskId field", async () => {
+    const task = makeTask({ id: "task-progress-001" });
+    const gateConfig = makeGateConfig({
+      "step-one": { type: "agent", behavior: "Analyze" },
+    });
+    const dispatch = makeDispatch();
+    const onProgress = vi.fn();
+
+    await executeTask(task, gateConfig, dispatch, onProgress);
+
+    // Must have been called at least once (not a vacuous assertion)
+    expect(onProgress).toHaveBeenCalled();
+
+    const events = onProgress.mock.calls.map(
+      (call: unknown[]) => call[0] as ProgressEvent,
+    );
+    for (const event of events) {
+      expect(event.taskId).toBe("task-progress-001");
+    }
+  });
+
+  it("ProgressEvent duration field is set on completed events", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-one": { type: "agent", behavior: "Analyze" },
+    });
+    const dispatch = makeDispatch();
+    const onProgress = vi.fn();
+
+    await executeTask(task, gateConfig, dispatch, onProgress);
+
+    const completedEvent = onProgress.mock.calls.find(
+      (call: unknown[]) => (call[0] as ProgressEvent).status === "completed",
+    );
+    expect(completedEvent).toBeDefined();
+    const event = completedEvent![0] as ProgressEvent;
+    expect(typeof event.duration).toBe("number");
+    expect(event.duration).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ---------------------------------------------------------------
+// Group 10: Retry Re-Execution
+// ---------------------------------------------------------------
+describe("retry re-execution", () => {
+  it("does not retry when maxRetries is 0 (default behavior)", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent" },
+    });
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >().mockResolvedValue(makeStepOutput({ error: "step failed" }));
+
+    const result = await executeTask(task, gateConfig, dispatch);
+
+    expect(result.status).toBe("failed");
+    expect(result.subtasks![0].status).toBe("failed");
+    expect(result.subtasks![0].attempt).toBe(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries once when maxRetries is 1 and first attempt fails", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", retryPolicy: { maxRetries: 1 } },
+    });
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >()
+      .mockResolvedValueOnce(makeStepOutput({ error: "transient failure" }))
+      .mockResolvedValueOnce(makeStepOutput({ output: "success on retry" }));
+
+    const result = await executeTask(task, gateConfig, dispatch);
+
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(result.subtasks![0].status).toBe("completed");
+    expect(result.subtasks![0].attempt).toBe(2);
+    expect(result.status).toBe("completed");
+  });
+
+  it("fails permanently after retries exhausted (maxRetries=1, both attempts fail)", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", retryPolicy: { maxRetries: 1 } },
+    });
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >().mockResolvedValue(makeStepOutput({ error: "persistent failure" }));
+
+    const result = await executeTask(task, gateConfig, dispatch);
+
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(result.subtasks![0].status).toBe("failed");
+    expect(result.subtasks![0].attempt).toBe(2);
+    expect(result.status).toBe("failed");
+  });
+
+  it("retries multiple times when maxRetries is greater than 1", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", retryPolicy: { maxRetries: 3 } },
+    });
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >()
+      .mockResolvedValueOnce(makeStepOutput({ error: "fail 1" }))
+      .mockResolvedValueOnce(makeStepOutput({ error: "fail 2" }))
+      .mockResolvedValueOnce(makeStepOutput({ error: "fail 3" }))
+      .mockResolvedValueOnce(makeStepOutput({ output: "success on attempt 4" }));
+
+    const result = await executeTask(task, gateConfig, dispatch);
+
+    expect(dispatch).toHaveBeenCalledTimes(4);
+    expect(result.subtasks![0].status).toBe("completed");
+    expect(result.subtasks![0].attempt).toBe(4);
+  });
+
+  it("resets subtask status to pending before retry", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", retryPolicy: { maxRetries: 1 } },
+    });
+    const statusAtDispatch: string[] = [];
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >().mockImplementation(async () => {
+      statusAtDispatch.push(task.subtasks![0].status);
+      if (statusAtDispatch.length === 1) {
+        return makeStepOutput({ error: "first attempt fails" });
+      }
+      return makeStepOutput({ output: "retry succeeds" });
+    });
+
+    await executeTask(task, gateConfig, dispatch);
+
+    // On both dispatch calls, the subtask should be "active" (reset to pending then activated)
+    expect(statusAtDispatch[0]).toBe("active");
+    expect(statusAtDispatch[1]).toBe("active");
+  });
+
+  it("increments attempt counter on each retry", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", retryPolicy: { maxRetries: 2 } },
+    });
+    const capturedAttempts: number[] = [];
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >().mockImplementation(async () => {
+      capturedAttempts.push(task.subtasks![0].attempt);
+      if (capturedAttempts.length < 3) {
+        return makeStepOutput({ error: `fail attempt ${capturedAttempts.length}` });
+      }
+      return makeStepOutput({ output: "success" });
+    });
+
+    await executeTask(task, gateConfig, dispatch);
+
+    expect(capturedAttempts).toEqual([1, 2, 3]);
+  });
+
+  it("safety guard prevents infinite retry loops", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", retryPolicy: { maxRetries: 1 } },
+    });
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >().mockResolvedValue(makeStepOutput({ error: "always fails" }));
+
+    const result = await executeTask(task, gateConfig, dispatch);
+
+    // With maxRetries=1, at most 2 total attempts (1 initial + 1 retry)
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(result.subtasks![0].attempt).toBeLessThanOrEqual(2);
+    expect(result.status).toBe("failed");
+  });
+
+  it("handles retry when failure is via thrown exception (not error field)", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", retryPolicy: { maxRetries: 1 } },
+    });
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >()
+      .mockRejectedValueOnce(new Error("transient crash"))
+      .mockResolvedValueOnce(makeStepOutput({ output: "recovered" }));
+
+    const result = await executeTask(task, gateConfig, dispatch);
+
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(result.subtasks![0].status).toBe("completed");
+    expect(result.status).toBe("completed");
+  });
+
+  it("clears subtask error and timestamps on retry reset", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", retryPolicy: { maxRetries: 1 } },
+    });
+    let capturedErrorOnRetry: string | undefined = "NOT_CAPTURED";
+    let capturedCompletedAtOnRetry: Date | undefined | null = null;
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >().mockImplementation(async () => {
+      const subtask = task.subtasks![0];
+      if (dispatch.mock.calls.length === 2) {
+        // On second call (retry), capture the reset state
+        capturedErrorOnRetry = subtask.error;
+        capturedCompletedAtOnRetry = subtask.completedAt;
+      }
+      if (dispatch.mock.calls.length === 1) {
+        return makeStepOutput({ error: "first attempt fails" });
+      }
+      return makeStepOutput({ output: "retry succeeds" });
+    });
+
+    await executeTask(task, gateConfig, dispatch);
+
+    expect(capturedErrorOnRetry).toBeUndefined();
+    expect(capturedCompletedAtOnRetry).toBeUndefined();
+  });
+
+  it("does not accumulate outputs from failed retry attempts", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", retryPolicy: { maxRetries: 1 } },
+      "step-b": { type: "script" },
+    });
+
+    let capturedPriorOutputs: Record<string, StepOutput> | undefined;
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >().mockImplementation(async (subtask, _step, context) => {
+      if (subtask.stepId === "step-b") {
+        capturedPriorOutputs = context.priorOutputs;
+        return makeStepOutput({ output: "step-b done" });
+      }
+      // step-a: fail first, succeed on retry with specific output
+      if (dispatch.mock.calls.length === 1) {
+        return makeStepOutput({ output: "failed output", error: "transient" });
+      }
+      return makeStepOutput({ output: "successful retry output" });
+    });
+
+    await executeTask(task, gateConfig, dispatch);
+
+    expect(capturedPriorOutputs).toBeDefined();
+    expect(capturedPriorOutputs!["step-a"]).toBeDefined();
+    expect(capturedPriorOutputs!["step-a"].output).toBe("successful retry output");
+    expect(capturedPriorOutputs!["step-a"].error).toBeUndefined();
+  });
+
+  it("emits progress events for retry attempts", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", behavior: "Retryable step", retryPolicy: { maxRetries: 1 } },
+    });
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >()
+      .mockResolvedValueOnce(makeStepOutput({ error: "attempt 1 fails" }))
+      .mockResolvedValueOnce(makeStepOutput({ output: "attempt 2 succeeds" }));
+    const onProgress = vi.fn();
+
+    await executeTask(task, gateConfig, dispatch, onProgress);
+
+    // Expected event sequence: started(1) -> failed(1) -> started(2) -> completed(2)
+    expect(onProgress).toHaveBeenCalledTimes(4);
+    const events = onProgress.mock.calls.map(
+      (call: unknown[]) => call[0] as ProgressEvent,
+    );
+    expect(events[0].status).toBe("started");
+    expect(events[1].status).toBe("failed");
+    expect(events[2].status).toBe("started");
+    expect(events[3].status).toBe("completed");
+  });
+
+  it("emits progress events when all retries exhausted", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", behavior: "Failing step", retryPolicy: { maxRetries: 1 } },
+    });
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >().mockResolvedValue(makeStepOutput({ error: "always fails" }));
+    const onProgress = vi.fn();
+
+    await executeTask(task, gateConfig, dispatch, onProgress);
+
+    // Expected event sequence: started(1) -> failed(1) -> started(2) -> failed(2)
+    expect(onProgress).toHaveBeenCalledTimes(4);
+    const events = onProgress.mock.calls.map(
+      (call: unknown[]) => call[0] as ProgressEvent,
+    );
+    expect(events[0].status).toBe("started");
+    expect(events[1].status).toBe("failed");
+    expect(events[2].status).toBe("started");
+    expect(events[3].status).toBe("failed");
+  });
+});
+
+// ---------------------------------------------------------------
+// Group 11: Retry Integration
+// ---------------------------------------------------------------
+describe("retry integration", () => {
+  it("failing step with maxRetries=1 retries once then fails permanently in multi-step workflow", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", behavior: "First step" },
+      "step-b": { type: "script", behavior: "Retryable step", retryPolicy: { maxRetries: 1 } },
+      "step-c": { type: "tool", behavior: "Third step" },
+    });
+
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >().mockImplementation(async (subtask) => {
+      if (subtask.stepId === "step-a") {
+        return makeStepOutput({ output: "step-a done" });
+      }
+      // step-b always fails
+      return makeStepOutput({ error: "step-b broke" });
+    });
+
+    const result = await executeTask(task, gateConfig, dispatch);
+
+    expect(result.status).toBe("failed");
+    expect(result.subtasks![0].status).toBe("completed");
+    expect(result.subtasks![1].status).toBe("failed");
+    expect(result.subtasks![2].status).toBe("pending");
+    // step-a dispatched once, step-b dispatched twice (initial + 1 retry)
+    expect(dispatch).toHaveBeenCalledTimes(3);
+  });
+
+  it("step succeeds on retry and workflow continues", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", behavior: "First step" },
+      "step-b": { type: "script", behavior: "Retryable step", retryPolicy: { maxRetries: 1 } },
+      "step-c": { type: "tool", behavior: "Third step" },
+    });
+
+    let stepBCallCount = 0;
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >().mockImplementation(async (subtask) => {
+      if (subtask.stepId === "step-a") {
+        return makeStepOutput({ output: "step-a done" });
+      }
+      if (subtask.stepId === "step-b") {
+        stepBCallCount++;
+        if (stepBCallCount === 1) {
+          return makeStepOutput({ error: "transient failure" });
+        }
+        return makeStepOutput({ output: "step-b recovered" });
+      }
+      return makeStepOutput({ output: "step-c done" });
+    });
+
+    const result = await executeTask(task, gateConfig, dispatch);
+
+    expect(result.status).toBe("completed");
+    for (const subtask of result.subtasks!) {
+      expect(subtask.status).toBe("completed");
+    }
+    // step-a: 1, step-b: 2 (fail + retry), step-c: 1 = 4 total
+    expect(dispatch).toHaveBeenCalledTimes(4);
+  });
+
+  it("retry does not affect prior step outputs for subsequent steps", async () => {
+    const task = makeTask();
+    const gateConfig = makeGateConfig({
+      "step-a": { type: "agent", retryPolicy: { maxRetries: 1 } },
+      "step-b": { type: "script" },
+    });
+
+    let capturedPriorOutputs: Record<string, StepOutput> | undefined;
+    let stepACallCount = 0;
+    const dispatch = vi.fn<
+      [Subtask, StepDefinition, StepContext],
+      Promise<StepOutput>
+    >().mockImplementation(async (subtask, _step, context) => {
+      if (subtask.stepId === "step-a") {
+        stepACallCount++;
+        if (stepACallCount === 1) {
+          return makeStepOutput({ output: "failed output", error: "transient" });
+        }
+        return makeStepOutput({ output: "correct retry output", outputFiles: ["retry.md"] });
+      }
+      // step-b captures priorOutputs
+      capturedPriorOutputs = context.priorOutputs;
+      return makeStepOutput({ output: "step-b done" });
+    });
+
+    const result = await executeTask(task, gateConfig, dispatch);
+
+    expect(result.status).toBe("completed");
+    expect(capturedPriorOutputs).toBeDefined();
+    expect(capturedPriorOutputs!["step-a"]).toBeDefined();
+    expect(capturedPriorOutputs!["step-a"].output).toBe("correct retry output");
+    expect(capturedPriorOutputs!["step-a"].outputFiles).toEqual(["retry.md"]);
+    // The failed attempt's error should not be in the accumulated output
+    expect(capturedPriorOutputs!["step-a"].error).toBeUndefined();
   });
 });

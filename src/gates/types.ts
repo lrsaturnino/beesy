@@ -132,6 +132,8 @@ export interface StepDefinition {
   outputFiles?: string[];
   /** Description of step behavior. */
   behavior?: string;
+  /** Retry configuration for the step (maxRetries = 0 means no retries). */
+  retryPolicy?: { maxRetries: number };
 }
 
 /** Workspace configuration for git-backed task execution. */

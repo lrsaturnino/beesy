@@ -641,6 +641,513 @@ describe("worker processing", () => {
 });
 
 // ---------------------------------------------------------------
+// Group 3b: Thread-Routed Task Execution
+// ---------------------------------------------------------------
+
+describe("thread-routed task execution", () => {
+  it("worker processor creates thread before executing task", async () => {
+    await writeGateYaml("test-trivial.yaml", TEST_TRIVIAL_YAML);
+
+    app = await startApp({ gatesDir: tempDir });
+
+    const { registerBackend } = await import("../../src/runners/registry.js");
+    registerBackend("cli-claude", createMockBackend("cli-claude", "mock output"));
+    expect(capturedProcessor).not.toBeNull();
+
+    // First call (thread creation) returns a ts; subsequent calls succeed normally
+    mockPostMessage
+      .mockResolvedValueOnce({ ok: true, ts: "thread.1234" })
+      .mockResolvedValue({ ok: true });
+
+    const mockJob = {
+      id: "job-thread-001",
+      data: {
+        id: "task-thread-001",
+        gate: "test-trivial",
+        status: "queued",
+        priority: "normal",
+        position: 0,
+        payload: { text: "test thread creation" },
+        requestedBy: "U456",
+        sourceChannel: {
+          platform: "slack",
+          channelId: "C-THREAD",
+        },
+        createdAt: new Date().toISOString(),
+        cost: makeCostAccumulator(),
+        gateConfig: {
+          gate: {
+            id: "test-trivial",
+            name: "Test Trivial Gate",
+            command: "/test-trivial",
+            description: "Thread test gate",
+          },
+          input: { required: [{ description: "Input" }] },
+          workflow: { steps: ["echo"] },
+          steps: {
+            echo: {
+              execution: {
+                type: "agent",
+                config: {
+                  model: "anthropic/claude-sonnet-4-20250514",
+                  tools: ["read"],
+                  timeoutMs: 60000,
+                },
+              },
+              behavior: "Echo",
+            },
+          },
+        },
+      },
+    };
+
+    await capturedProcessor!(mockJob);
+
+    // Thread creation should be the first postMessage call (no thread_ts)
+    expect(mockPostMessage).toHaveBeenCalled();
+    const firstCall = mockPostMessage.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(firstCall.channel).toBe("C-THREAD");
+    expect(firstCall.thread_ts).toBeUndefined();
+
+    // Subsequent calls (result reply) should include thread_ts from thread creation
+    const replyCalls = mockPostMessage.mock.calls.filter(
+      (_: unknown, i: number) => i > 0,
+    );
+    const replyToThread = replyCalls.find(
+      (c: unknown[]) => (c[0] as Record<string, unknown>)?.channel === "C-THREAD",
+    );
+    expect(replyToThread).toBeDefined();
+    expect((replyToThread![0] as Record<string, unknown>).thread_ts).toBe("thread.1234");
+  });
+
+  it("result reply routes to the created thread", async () => {
+    await writeGateYaml("test-trivial.yaml", TEST_TRIVIAL_YAML);
+
+    app = await startApp({ gatesDir: tempDir });
+
+    const { registerBackend } = await import("../../src/runners/registry.js");
+    registerBackend("cli-claude", createMockBackend("cli-claude", "mock output"));
+    expect(capturedProcessor).not.toBeNull();
+
+    mockPostMessage
+      .mockResolvedValueOnce({ ok: true, ts: "thread.5678" })
+      .mockResolvedValue({ ok: true });
+
+    const mockJob = {
+      id: "job-thread-002",
+      data: {
+        id: "task-thread-002",
+        gate: "test-trivial",
+        status: "queued",
+        priority: "normal",
+        position: 0,
+        payload: { text: "test reply routing" },
+        requestedBy: "U456",
+        sourceChannel: {
+          platform: "slack",
+          channelId: "C-REPLY",
+        },
+        createdAt: new Date().toISOString(),
+        cost: makeCostAccumulator(),
+        gateConfig: {
+          gate: {
+            id: "test-trivial",
+            name: "Test Trivial Gate",
+            command: "/test-trivial",
+            description: "Reply routing test",
+          },
+          input: { required: [{ description: "Input" }] },
+          workflow: { steps: ["echo"] },
+          steps: {
+            echo: {
+              execution: {
+                type: "agent",
+                config: {
+                  model: "anthropic/claude-sonnet-4-20250514",
+                  tools: ["read"],
+                  timeoutMs: 60000,
+                },
+              },
+              behavior: "Echo",
+            },
+          },
+        },
+      },
+    };
+
+    await capturedProcessor!(mockJob);
+
+    // Find the completion reply call (should be the last postMessage to C-REPLY)
+    const calls = mockPostMessage.mock.calls;
+    const replyCalls = calls.filter(
+      (c: unknown[]) => (c[0] as Record<string, unknown>)?.channel === "C-REPLY",
+    );
+    expect(replyCalls.length).toBeGreaterThanOrEqual(2);
+
+    // The last call to C-REPLY is the completion reply -- it should have thread_ts
+    const lastReply = replyCalls[replyCalls.length - 1];
+    expect((lastReply[0] as Record<string, unknown>).thread_ts).toBe("thread.5678");
+  });
+
+  it("thread creation failure degrades to flat-channel posting without crashing", async () => {
+    await writeGateYaml("test-trivial.yaml", TEST_TRIVIAL_YAML);
+
+    app = await startApp({ gatesDir: tempDir });
+
+    const { registerBackend } = await import("../../src/runners/registry.js");
+    registerBackend("cli-claude", createMockBackend("cli-claude", "mock output"));
+    expect(capturedProcessor).not.toBeNull();
+
+    // First call (thread creation) fails; subsequent calls succeed
+    mockPostMessage
+      .mockRejectedValueOnce(new Error("slack_api_error"))
+      .mockResolvedValue({ ok: true });
+
+    const mockJob = {
+      id: "job-thread-003",
+      data: {
+        id: "task-thread-003",
+        gate: "test-trivial",
+        status: "queued",
+        priority: "normal",
+        position: 0,
+        payload: { text: "test degradation" },
+        requestedBy: "U456",
+        sourceChannel: {
+          platform: "slack",
+          channelId: "C-DEGRADE",
+        },
+        createdAt: new Date().toISOString(),
+        cost: makeCostAccumulator(),
+        gateConfig: {
+          gate: {
+            id: "test-trivial",
+            name: "Test Trivial Gate",
+            command: "/test-trivial",
+            description: "Degradation test",
+          },
+          input: { required: [{ description: "Input" }] },
+          workflow: { steps: ["echo"] },
+          steps: {
+            echo: {
+              execution: {
+                type: "agent",
+                config: {
+                  model: "anthropic/claude-sonnet-4-20250514",
+                  tools: ["read"],
+                  timeoutMs: 60000,
+                },
+              },
+              behavior: "Echo",
+            },
+          },
+        },
+      },
+    };
+
+    // Task should execute without crashing despite thread creation failure
+    await expect(capturedProcessor!(mockJob)).resolves.not.toThrow();
+
+    // A reply should still be sent (flat channel, no thread_ts)
+    const calls = mockPostMessage.mock.calls;
+    const replyCalls = calls.filter(
+      (c: unknown[], i: number) =>
+        i > 0 && (c[0] as Record<string, unknown>)?.channel === "C-DEGRADE",
+    );
+    expect(replyCalls.length).toBeGreaterThanOrEqual(1);
+
+    // The result reply should NOT have thread_ts (flat-channel degradation)
+    const resultReply = replyCalls[replyCalls.length - 1];
+    expect((resultReply[0] as Record<string, unknown>).thread_ts).toBeUndefined();
+  });
+
+  it("thread-scoped ChannelRef preserves original channel ID", async () => {
+    await writeGateYaml("test-trivial.yaml", TEST_TRIVIAL_YAML);
+
+    app = await startApp({ gatesDir: tempDir });
+
+    const { registerBackend } = await import("../../src/runners/registry.js");
+    registerBackend("cli-claude", createMockBackend("cli-claude", "mock output"));
+    expect(capturedProcessor).not.toBeNull();
+
+    mockPostMessage
+      .mockResolvedValueOnce({ ok: true, ts: "thread.9999" })
+      .mockResolvedValue({ ok: true });
+
+    const mockJob = {
+      id: "job-thread-004",
+      data: {
+        id: "task-thread-004",
+        gate: "test-trivial",
+        status: "queued",
+        priority: "normal",
+        position: 0,
+        payload: { text: "test channel preservation" },
+        requestedBy: "U456",
+        sourceChannel: {
+          platform: "slack",
+          channelId: "C-PRESERVE",
+        },
+        createdAt: new Date().toISOString(),
+        cost: makeCostAccumulator(),
+        gateConfig: {
+          gate: {
+            id: "test-trivial",
+            name: "Test Trivial Gate",
+            command: "/test-trivial",
+            description: "Channel preservation test",
+          },
+          input: { required: [{ description: "Input" }] },
+          workflow: { steps: ["echo"] },
+          steps: {
+            echo: {
+              execution: {
+                type: "agent",
+                config: {
+                  model: "anthropic/claude-sonnet-4-20250514",
+                  tools: ["read"],
+                  timeoutMs: 60000,
+                },
+              },
+              behavior: "Echo",
+            },
+          },
+        },
+      },
+    };
+
+    await capturedProcessor!(mockJob);
+
+    // All postMessage calls to C-PRESERVE should use the same channel ID
+    const calls = mockPostMessage.mock.calls.filter(
+      (c: unknown[]) => (c[0] as Record<string, unknown>)?.channel === "C-PRESERVE",
+    );
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+
+    // The reply call should preserve channel ID and add thread_ts
+    const replyCall = calls[calls.length - 1];
+    const replyArgs = replyCall[0] as Record<string, unknown>;
+    expect(replyArgs.channel).toBe("C-PRESERVE");
+    expect(replyArgs.thread_ts).toBe("thread.9999");
+  });
+});
+
+// ---------------------------------------------------------------
+// Group 3c: Progress Notifications (Integration)
+// ---------------------------------------------------------------
+
+/** Multi-step gate YAML for progress notification integration tests. */
+const TEST_MULTI_STEP_YAML = `
+gate:
+  id: test-multi
+  name: "Test Multi-Step Gate"
+  command: /test-multi
+  description: "Two-step gate for progress notification testing"
+
+input:
+  required:
+    - description: "A brief description"
+
+workflow:
+  steps:
+    - analyze
+    - implement
+
+steps:
+  analyze:
+    execution:
+      type: agent
+      config:
+        model: anthropic/claude-sonnet-4-20250514
+        tools:
+          - read
+        timeoutMs: 60000
+    behavior: "Analyze the input"
+  implement:
+    execution:
+      type: script
+      command: "node scripts/run.js"
+      timeoutMs: 30000
+    behavior: "Apply implementation"
+`;
+
+describe("progress notifications", () => {
+  it("worker processor sends formatted progress messages to thread", async () => {
+    await writeGateYaml("test-trivial.yaml", TEST_TRIVIAL_YAML);
+
+    app = await startApp({ gatesDir: tempDir });
+
+    const { registerBackend } = await import("../../src/runners/registry.js");
+    registerBackend("cli-claude", createMockBackend("cli-claude", "mock output"));
+    expect(capturedProcessor).not.toBeNull();
+
+    // First call: thread creation; subsequent calls: progress + result replies
+    mockPostMessage
+      .mockResolvedValueOnce({ ok: true, ts: "thread.progress-001" })
+      .mockResolvedValue({ ok: true });
+
+    const mockJob = {
+      id: "job-progress-001",
+      data: {
+        id: "task-progress-001",
+        gate: "test-trivial",
+        status: "queued",
+        priority: "normal",
+        position: 0,
+        payload: { text: "test progress messages" },
+        requestedBy: "U456",
+        sourceChannel: {
+          platform: "slack",
+          channelId: "C-PROGRESS",
+        },
+        createdAt: new Date().toISOString(),
+        cost: makeCostAccumulator(),
+        gateConfig: {
+          gate: {
+            id: "test-trivial",
+            name: "Test Trivial Gate",
+            command: "/test-trivial",
+            description: "Progress notification test",
+          },
+          input: { required: [{ description: "Input" }] },
+          workflow: { steps: ["echo"] },
+          steps: {
+            echo: {
+              execution: {
+                type: "agent",
+                config: {
+                  model: "anthropic/claude-sonnet-4-20250514",
+                  tools: ["read"],
+                  timeoutMs: 60000,
+                },
+              },
+              behavior: "Echo the input",
+            },
+          },
+        },
+      },
+    };
+
+    await capturedProcessor!(mockJob);
+
+    // Collect all postMessage calls targeting C-PROGRESS with thread_ts
+    const threadCalls = mockPostMessage.mock.calls.filter(
+      (c: unknown[]) => {
+        const args = c[0] as Record<string, unknown>;
+        return args.channel === "C-PROGRESS" && args.thread_ts === "thread.progress-001";
+      },
+    );
+
+    // At least one call should contain a formatted progress string
+    const progressCalls = threadCalls.filter((c: unknown[]) => {
+      const text = (c[0] as Record<string, unknown>).text as string;
+      return /Step \d+\/\d+:/.test(text);
+    });
+    expect(progressCalls.length).toBeGreaterThanOrEqual(1);
+
+    // Verify the format matches "Step N/M: <name> (<type>) -- <status>"
+    const firstProgressText = (progressCalls[0][0] as Record<string, unknown>).text as string;
+    expect(firstProgressText).toMatch(/Step 1\/1:.+\(.+\) -- (started|completed)/);
+  });
+
+  it("progress callback error does not crash worker or block subsequent progress events", async () => {
+    await writeGateYaml("test-multi.yaml", TEST_MULTI_STEP_YAML);
+
+    app = await startApp({ gatesDir: tempDir });
+
+    const { registerBackend } = await import("../../src/runners/registry.js");
+    registerBackend("cli-claude", createMockBackend("cli-claude", "analyze output"));
+
+    // Mock the script runner to succeed for the second step
+    const scriptRunner = await import("../../src/executor/script-runner.js");
+    vi.spyOn(scriptRunner, "runScript").mockResolvedValue({
+      output: "implement output",
+      outputFiles: [],
+    });
+
+    expect(capturedProcessor).not.toBeNull();
+
+    // Thread creation succeeds, first progress call rejects, rest succeed
+    let callCount = 0;
+    mockPostMessage.mockImplementation(async () => {
+      callCount++;
+      // Call 1: thread creation (succeed)
+      // Call 2: first progress event (reject to simulate send error)
+      if (callCount === 2) {
+        throw new Error("simulated Slack API error on progress");
+      }
+      // All other calls succeed
+      return { ok: true, ts: "thread.progress-err" };
+    });
+
+    const mockJob = {
+      id: "job-progress-err",
+      data: {
+        id: "task-progress-err",
+        gate: "test-multi",
+        status: "queued",
+        priority: "normal",
+        position: 0,
+        payload: { text: "test progress error isolation" },
+        requestedBy: "U456",
+        sourceChannel: {
+          platform: "slack",
+          channelId: "C-PROGRESS-ERR",
+        },
+        createdAt: new Date().toISOString(),
+        cost: makeCostAccumulator(),
+        gateConfig: {
+          gate: {
+            id: "test-multi",
+            name: "Test Multi-Step Gate",
+            command: "/test-multi",
+            description: "Error isolation test",
+          },
+          input: { required: [{ description: "Input" }] },
+          workflow: { steps: ["analyze", "implement"] },
+          steps: {
+            analyze: {
+              execution: {
+                type: "agent",
+                config: {
+                  model: "anthropic/claude-sonnet-4-20250514",
+                  tools: ["read"],
+                  timeoutMs: 60000,
+                },
+              },
+              behavior: "Analyze the input",
+            },
+            implement: {
+              execution: {
+                type: "script",
+                command: "node scripts/run.js",
+                timeoutMs: 30000,
+              },
+              behavior: "Apply implementation",
+            },
+          },
+        },
+      },
+    };
+
+    // Task should complete despite progress send error
+    await expect(capturedProcessor!(mockJob)).resolves.not.toThrow();
+
+    // Multiple postMessage calls should have been made (not stopped after error)
+    expect(mockPostMessage.mock.calls.length).toBeGreaterThan(2);
+
+    // A completion reply should still be present
+    const completionCalls = mockPostMessage.mock.calls.filter(
+      (c: unknown[]) => {
+        const text = (c[0] as Record<string, unknown>).text as string;
+        return typeof text === "string" && text.includes("completed");
+      },
+    );
+    expect(completionCalls.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ---------------------------------------------------------------
 // Group 4: Graceful Shutdown
 // ---------------------------------------------------------------
 

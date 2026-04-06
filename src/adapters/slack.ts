@@ -105,6 +105,36 @@ export class SlackAdapter implements Adapter {
     }
   }
 
+  /** Create a new conversation thread by posting an initial message and returning its timestamp. */
+  async createThread(channelId: string, text: string): Promise<string> {
+    const args = {
+      channel: channelId,
+      text,
+    } as Parameters<typeof this.app.client.chat.postMessage>[0];
+
+    let result: Awaited<ReturnType<typeof this.app.client.chat.postMessage>>;
+    try {
+      result = await this.app.client.chat.postMessage(args);
+    } catch (error) {
+      const msg = errorMessage(error);
+      this.log.error("Failed to create thread", {
+        channelId,
+        error: msg,
+      });
+      throw new Error(
+        `Failed to create thread in channel ${channelId}: ${msg}`,
+      );
+    }
+
+    if (!result.ts) {
+      const msg = "Slack API returned no timestamp for the posted message";
+      this.log.error("Failed to create thread", { channelId, error: msg });
+      throw new Error(`Failed to create thread in channel ${channelId}: ${msg}`);
+    }
+
+    return result.ts;
+  }
+
   /** Register slash command and mention event handlers on the Bolt App. */
   private registerHandlers(): void {
     // Catch-all slash command handler

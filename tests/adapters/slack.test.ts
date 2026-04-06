@@ -430,6 +430,43 @@ describe("listener management", () => {
 });
 
 // ---------------------------------------------------------------
+// Group 8: createThread
+// ---------------------------------------------------------------
+describe("createThread", () => {
+  it("posts initial message and returns thread timestamp", async () => {
+    const adapter = createSlackAdapter(TEST_CONFIG);
+    await adapter.connect();
+
+    mockPostMessage.mockResolvedValueOnce({ ok: true, ts: "1234567890.111111" });
+
+    const threadTs = await adapter.createThread("C67890", "Task started");
+
+    expect(threadTs).toBe("1234567890.111111");
+    expect(mockPostMessage).toHaveBeenCalledOnce();
+    const callArgs = mockPostMessage.mock.calls[0][0] as Record<string, unknown>;
+    expect(callArgs.channel).toBe("C67890");
+    expect(callArgs.text).toBe("Task started");
+    expect(callArgs.thread_ts).toBeUndefined();
+  });
+
+  it("propagates Slack API errors with descriptive message", async () => {
+    const adapter = createSlackAdapter(TEST_CONFIG);
+    await adapter.connect();
+
+    mockPostMessage.mockRejectedValueOnce(new Error("channel_not_found"));
+
+    await expect(
+      adapter.createThread("C99999", "will fail"),
+    ).rejects.toThrow(/C99999/);
+  });
+
+  it("is exposed on the Adapter interface via factory", () => {
+    const adapter = createSlackAdapter(TEST_CONFIG);
+    expect(typeof adapter.createThread).toBe("function");
+  });
+});
+
+// ---------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------
 

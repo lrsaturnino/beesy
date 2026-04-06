@@ -169,7 +169,7 @@ describe("timeout enforcement", () => {
     // The implementation should support a configurable timeout for testing purposes.
     // We test with the exported function that accepts an optional timeout parameter.
     const { runScript: runScriptWithTimeout } = await import("../../src/executor/script-runner.js");
-    const result = await runScriptWithTimeout(cmd, undefined, makeStepContext(), 500);
+    const result = await runScriptWithTimeout(cmd, undefined, makeStepContext(), undefined, 500);
 
     expect(result.error).toBeDefined();
     expect(result.error!.toLowerCase()).toContain("timeout");
@@ -179,7 +179,7 @@ describe("timeout enforcement", () => {
     const cmd = `node -e "setTimeout(()=>{},60000)"`;
 
     const { runScript: runScriptWithTimeout } = await import("../../src/executor/script-runner.js");
-    const result = await runScriptWithTimeout(cmd, undefined, makeStepContext(), 500);
+    const result = await runScriptWithTimeout(cmd, undefined, makeStepContext(), undefined, 500);
 
     expect(result.output).toBe("");
     expect(result.outputFiles).toEqual([]);
@@ -223,8 +223,72 @@ describe("uniform StepOutput structure", () => {
     // Timeout case
     const { runScript: runScriptWithTimeout } = await import("../../src/executor/script-runner.js");
     const timeoutCmd = `node -e "setTimeout(()=>{},60000)"`;
-    const timeoutResult = await runScriptWithTimeout(timeoutCmd, undefined, makeStepContext(), 500);
+    const timeoutResult = await runScriptWithTimeout(timeoutCmd, undefined, makeStepContext(), undefined, 500);
     expect(typeof timeoutResult.output).toBe("string");
     expect(Array.isArray(timeoutResult.outputFiles)).toBe(true);
   }, 10_000);
+});
+
+// ---------------------------------------------------------------
+// Group 8: onStderr Callback
+// ---------------------------------------------------------------
+describe("onStderr callback", () => {
+  it("invokes onStderr with stderr lines when callback is provided", async () => {
+    const cmd = `node -e "process.stderr.write('warn-line-1\\nwarn-line-2\\n');process.stdout.write(JSON.stringify({output:'ok',output_files:[]}))"`;
+    const onStderr = vi.fn();
+
+    await runScript(cmd, undefined, makeStepContext(), onStderr);
+
+    expect(onStderr).toHaveBeenCalled();
+    // Collect all lines passed across invocations
+    const allLines: string[] = onStderr.mock.calls.flatMap(
+      (call: [string[]]) => call[0],
+    );
+    expect(allLines).toContain("warn-line-1");
+    expect(allLines).toContain("warn-line-2");
+  });
+
+  it("does not crash when no onStderr callback is provided", async () => {
+    const cmd = `node -e "process.stderr.write('some stderr\\n');process.stdout.write(JSON.stringify({output:'still works',output_files:[]}))"`;
+
+    const result = await runScript(cmd, undefined, makeStepContext());
+
+    expect(result.output).toBe("still works");
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("invokes onStderr for each stderr data chunk", async () => {
+    // Two separate stderr writes with a small delay to produce distinct data events
+    const cmd = `node -e "
+      process.stderr.write('chunk-A\\n');
+      setTimeout(() => {
+        process.stderr.write('chunk-B\\n');
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({output:'done',output_files:[]}));
+        }, 50);
+      }, 50);
+    "`;
+    const collected: string[][] = [];
+    const onStderr = (lines: string[]) => {
+      collected.push([...lines]);
+    };
+
+    await runScript(cmd, undefined, makeStepContext(), onStderr);
+
+    const allLines = collected.flat();
+    expect(allLines).toContain("chunk-A");
+    expect(allLines).toContain("chunk-B");
+  });
+
+  it("does not affect StepOutput structure when onStderr is provided", async () => {
+    const cmd = `node -e "process.stderr.write('diag info\\n');process.stdout.write(JSON.stringify({output:'result-val',output_files:['f.md']}))"`;
+    const onStderr = vi.fn();
+
+    const result = await runScript(cmd, undefined, makeStepContext(), onStderr);
+
+    expect(result.output).toBe("result-val");
+    expect(result.outputFiles).toEqual(["f.md"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.error).toBeUndefined();
+  });
 });

@@ -2,8 +2,9 @@
  * Gate YAML configuration loader with comprehensive validation.
  *
  * Reads .yaml files from a gates directory, parses them into GateConfig
- * objects, validates against schema rules, and returns structured results
- * with loaded configs, errors, and warnings.
+ * objects, resolves scoped {{env.VAR}} templates in script step env fields,
+ * validates against schema rules, and returns structured results with loaded
+ * configs, errors, and warnings.
  *
  * @module gates/loader
  */
@@ -45,6 +46,13 @@ const VALID_EXECUTION_TYPES: ReadonlySet<string> = new Set([
   "script",
   "tool",
 ]);
+
+/**
+ * Pattern matching {{env.VAR_NAME}} templates where VAR_NAME follows
+ * POSIX environment variable naming: starts with a letter or underscore,
+ * followed by letters, digits, or underscores.
+ */
+const ENV_TEMPLATE_PATTERN = /\{\{env\.([A-Za-z_][A-Za-z0-9_]*)\}\}/g;
 
 /**
  * Convert a snake_case string to camelCase.
@@ -346,6 +354,102 @@ function validateHumanCheckpoints(
   return errors;
 }
 
+/** Result of resolving env var templates in a parsed gate config. */
+interface InterpolationResult {
+  /** The processed object (same reference, env values mutated in-place). */
+  result: Record<string, unknown>;
+  /** Errors for missing env vars in required fields (prevent gate loading). */
+  errors: ValidationMessage[];
+  /** Warnings for missing env vars in optional fields (non-blocking). */
+  warnings: ValidationMessage[];
+}
+
+/**
+ * Resolve a single env value string, replacing all {{env.VAR}} templates with
+ * their process.env values. Collects an error for each undefined variable.
+ *
+ * @returns The resolved string and any errors found during replacement
+ */
+function resolveEnvTemplates(
+  value: string,
+  stepId: string,
+  envKey: string,
+  filename: string,
+): { resolved: string; errors: ValidationMessage[] } {
+  const errors: ValidationMessage[] = [];
+
+  const resolved = value.replace(ENV_TEMPLATE_PATTERN, (match, varName: string) => {
+    const envValue = process.env[varName];
+    if (envValue === undefined) {
+      errors.push({
+        severity: "error",
+        file: filename,
+        message: `steps.${stepId}.execution.env.${envKey}: environment variable "${varName}" is not defined`,
+      });
+      return match;
+    }
+    return envValue;
+  });
+
+  return { resolved, errors };
+}
+
+/**
+ * Resolve {{env.VAR_NAME}} templates in script step execution.env values.
+ *
+ * Scoped interpolation: only string values inside steps.<stepId>.execution.env
+ * for script-type steps are processed. All other fields (gate metadata, workspace
+ * config, step behavior, descriptions) are left untouched. This prevents
+ * accidental materialization of secrets in non-execution fields.
+ *
+ * Missing environment variables in script step env fields produce errors that
+ * prevent gate loading, since a broken env map means a broken script process.
+ *
+ * @param parsed - Raw parsed YAML object with snake_case keys (pre-transformation)
+ * @param filename - Source filename for error message context
+ * @returns The processed object plus any errors and warnings collected during interpolation
+ */
+export function interpolateEnvVars(
+  parsed: Record<string, unknown>,
+  filename: string,
+): InterpolationResult {
+  const errors: ValidationMessage[] = [];
+  const warnings: ValidationMessage[] = [];
+
+  const steps = parsed.steps as Record<string, Record<string, unknown>> | undefined;
+  if (!steps || typeof steps !== "object") {
+    return { result: parsed, errors, warnings };
+  }
+
+  for (const [stepId, stepDef] of Object.entries(steps)) {
+    if (!stepDef || typeof stepDef !== "object") continue;
+    const execution = stepDef.execution as Record<string, unknown> | undefined;
+    if (!execution || execution.type !== "script") continue;
+
+    const env = execution.env as Record<string, string> | undefined;
+    if (!env || typeof env !== "object") continue;
+
+    for (const [envKey, envValue] of Object.entries(env)) {
+      if (typeof envValue !== "string") continue;
+
+      const { resolved, errors: templateErrors } = resolveEnvTemplates(
+        envValue,
+        stepId,
+        envKey,
+        filename,
+      );
+
+      if (templateErrors.length > 0) {
+        errors.push(...templateErrors);
+      } else {
+        env[envKey] = resolved;
+      }
+    }
+  }
+
+  return { result: parsed, errors, warnings };
+}
+
 /**
  * Validate a single parsed gate configuration by running all validation rules.
  *
@@ -396,6 +500,18 @@ async function checkWarnings(
       file: filename,
       message: `workspace.repo "${config.workspace.repo}" accessibility not verified at load time`,
     });
+  }
+
+  // Warn on high retry counts that may cause excessive execution time
+  for (const [stepId, stepDef] of Object.entries(config.steps)) {
+    const maxRetries = stepDef.retryPolicy?.maxRetries;
+    if (maxRetries !== undefined && maxRetries > 3) {
+      warnings.push({
+        severity: "warning",
+        file: filename,
+        message: `steps.${stepId}.retryPolicy.maxRetries is ${maxRetries} (> 3) -- consider reducing retry count`,
+      });
+    }
   }
 
   // Check skills directories and input_files only when projectRoot is provided
@@ -499,8 +615,19 @@ async function processGateFile(
     return { config: null, errors, warnings };
   }
 
-  const fileErrors = validateGateConfig(
+  const interpolation = interpolateEnvVars(
     parsed as Record<string, unknown>,
+    filename,
+  );
+  errors.push(...interpolation.errors);
+  warnings.push(...interpolation.warnings);
+
+  if (interpolation.errors.length > 0) {
+    return { config: null, errors, warnings };
+  }
+
+  const fileErrors = validateGateConfig(
+    interpolation.result,
     filename,
   );
 
@@ -508,7 +635,7 @@ async function processGateFile(
     return { config: null, errors: fileErrors, warnings };
   }
 
-  const config = transformKeys(parsed) as GateConfig;
+  const config = transformKeys(interpolation.result) as GateConfig;
   const fileWarnings = await checkWarnings(config, filename, options);
 
   return { config, errors, warnings: fileWarnings };
@@ -575,7 +702,7 @@ async function listYamlFiles(gatesDir: string): Promise<string[]> {
  *
  * Reads all .yaml and .yml files from the specified directory, parses each
  * into a GateConfig object with snake_case to camelCase key transformation,
- * validates against 13 error conditions and 4 warning conditions, and
+ * validates against 13 error conditions and 5 warning conditions, and
  * performs cross-file duplicate detection for gate IDs and commands.
  *
  * @param gatesDir - Path to the directory containing gate YAML files
