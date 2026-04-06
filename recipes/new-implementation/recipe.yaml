@@ -1,0 +1,34 @@
+recipe:
+  id: new-implementation
+  name: "New Implementation"
+  command: /new-implementation
+  description: "Full implementation workflow from planning through code delivery"
+
+orchestrator:
+  role: roles/orchestrators/implementation.md
+  backend: cli-claude
+  model: anthropic/claude-sonnet-4-20250514
+  effort: high
+  timeout_ms: 180000
+  max_stage_retries: 2
+  max_total_actions: 40
+
+stage_order:
+  - planning
+
+start_stage: planning
+
+stages:
+  planning:
+    role: roles/implementation/planning-create.md
+    objective: "Analyze the request and produce an implementation plan"
+    inputs:
+      - description: "User request"
+        source: task.payload.description
+    outputs:
+      - label: planning_doc
+        format: md
+        mirror_to:
+          - ".bees/planning.md"
+    allowed_transitions: []
+    allowed_scripts: []
