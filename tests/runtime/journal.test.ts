@@ -69,6 +69,12 @@ function createEntry(
     script_started: { scriptId: "knowledge.prime", taskId: "task-001", inputHash: "abc123" },
     script_completed: { scriptId: "knowledge.prime", summary: "knowledge context built", durationMs: 3200 },
     script_failed: { scriptId: "knowledge.prime", error: "script timed out after 30000ms", exitCode: 1 },
+    script_output_injected: { scriptId: "knowledge.prime", targetStageId: "coding", fieldName: "knowledge_context" },
+    delivery_stage_completed: { scriptId: "delivery.stage_explicit", stagedFiles: ["src/index.ts"], excludedFiles: [] },
+    delivery_commit_completed: { scriptId: "delivery.commit_with_trailers", commitSha: "abc1234", commitMessage: "feat: add feature" },
+    delivery_push_completed: { scriptId: "delivery.push_branch", remoteBranch: "origin/main", branchName: "feature/test" },
+    delivery_pr_completed: { scriptId: "delivery.upsert_draft_pr", prUrl: "https://github.com/org/repo/pull/1", prNumber: 1, action: "created" },
+    delivery_failed: { scriptId: "delivery.stage_explicit", error: "staging failed", deliveryStep: "stage" },
   };
 
   return { type, ...payloads[type], ...extra };
@@ -231,7 +237,7 @@ describe("readJournal -- Deserialization", () => {
 // Group 4: All 17 Entry Types
 // -------------------------------------------------------------------
 
-describe("All 17 Entry Types", () => {
+describe("All 22 Entry Types", () => {
   const ALL_TYPES: JournalEntryType[] = [
     "task_created",
     "subtask_queued",
@@ -250,10 +256,15 @@ describe("All 17 Entry Types", () => {
     "script_completed",
     "script_failed",
     "script_output_injected",
+    "delivery_stage_completed",
+    "delivery_commit_completed",
+    "delivery_push_completed",
+    "delivery_pr_completed",
+    "delivery_failed",
   ];
 
-  it("JOURNAL_ENTRY_TYPES contains all 17 types", () => {
-    expect(JOURNAL_ENTRY_TYPES).toHaveLength(17);
+  it("JOURNAL_ENTRY_TYPES contains all 22 types", () => {
+    expect(JOURNAL_ENTRY_TYPES).toHaveLength(22);
     for (const t of ALL_TYPES) {
       expect(JOURNAL_ENTRY_TYPES).toContain(t);
     }
@@ -361,7 +372,64 @@ describe("Script Execution Entry Types", () => {
     expect(JOURNAL_ENTRY_TYPES).toContain("script_failed");
   });
 
-  it("JOURNAL_ENTRY_TYPES has 17 total entry types after script additions", () => {
-    expect(JOURNAL_ENTRY_TYPES).toHaveLength(17);
+  it("JOURNAL_ENTRY_TYPES has 22 total entry types after script additions", () => {
+    expect(JOURNAL_ENTRY_TYPES).toHaveLength(22);
+  });
+});
+
+// -------------------------------------------------------------------
+// Group 7: Delivery Event Entry Types
+// -------------------------------------------------------------------
+
+describe("Delivery Event Entry Types", () => {
+  it("JOURNAL_ENTRY_TYPES includes delivery_stage_completed", () => {
+    expect(JOURNAL_ENTRY_TYPES).toContain("delivery_stage_completed");
+  });
+
+  it("JOURNAL_ENTRY_TYPES includes delivery_commit_completed", () => {
+    expect(JOURNAL_ENTRY_TYPES).toContain("delivery_commit_completed");
+  });
+
+  it("JOURNAL_ENTRY_TYPES includes delivery_push_completed", () => {
+    expect(JOURNAL_ENTRY_TYPES).toContain("delivery_push_completed");
+  });
+
+  it("JOURNAL_ENTRY_TYPES includes delivery_pr_completed", () => {
+    expect(JOURNAL_ENTRY_TYPES).toContain("delivery_pr_completed");
+  });
+
+  it("JOURNAL_ENTRY_TYPES includes delivery_failed", () => {
+    expect(JOURNAL_ENTRY_TYPES).toContain("delivery_failed");
+  });
+
+  it("JOURNAL_ENTRY_TYPES has 22 total entry types after delivery additions", () => {
+    expect(JOURNAL_ENTRY_TYPES).toHaveLength(22);
+  });
+
+  it("delivery event types serialize and deserialize correctly via append/read roundtrip", () => {
+    const deliveryTypes: JournalEntryType[] = [
+      "delivery_stage_completed",
+      "delivery_commit_completed",
+      "delivery_push_completed",
+      "delivery_pr_completed",
+      "delivery_failed",
+    ];
+
+    for (const entryType of deliveryTypes) {
+      const taskId = `task-delivery-${entryType}`;
+      const input = createEntry(entryType);
+
+      appendJournalEntry(runsDir, taskId, input);
+
+      const entries = readJournal(runsDir, taskId);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].type).toBe(entryType);
+      expect(entries[0].timestamp).toBeDefined();
+
+      for (const [key, value] of Object.entries(input)) {
+        if (key === "type") continue;
+        expect((entries[0] as Record<string, unknown>)[key]).toEqual(value);
+      }
+    }
   });
 });

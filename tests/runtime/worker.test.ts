@@ -39,6 +39,18 @@ vi.mock("../../src/runtime/script-handler.js", () => ({
   handleScriptRun: mockHandleScriptRun,
 }));
 
+// ---------------------------------------------------------------
+// Mock the workspace module for workspace wiring isolation
+// ---------------------------------------------------------------
+
+const { mockCreateWorkspace } = vi.hoisted(() => ({
+  mockCreateWorkspace: vi.fn(),
+}));
+
+vi.mock("../../src/utils/workspace.js", () => ({
+  createWorkspace: mockCreateWorkspace,
+}));
+
 // Import module under test
 import { runTask } from "../../src/runtime/worker.js";
 
@@ -1408,5 +1420,123 @@ describe("Registry Threading", () => {
     const journal = readJournal(runsDir, task.id);
     const errors = journal.filter((e) => e.type === "task_failed");
     expect(errors.length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------
+// Group 12: Workspace Wiring at Task Start
+// ---------------------------------------------------------------
+
+describe("Workspace Wiring at Task Start", () => {
+  it("runTask calls createWorkspace for recipe tasks without branchName", async () => {
+    const recipe = createTestRecipe();
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask({
+      recipeId: "test-recipe",
+      repoPath: "/tmp/test-repo",
+    });
+
+    mockCreateWorkspace.mockResolvedValue({
+      success: true,
+      workspacePath: "/tmp/ws/task-001",
+      branchName: "bees/task-001-build-a-widget",
+    });
+
+    const backend = createMockBackend([
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+
+    await runTask(task, recipe, runsDir);
+
+    // Workspace creation should have been called
+    expect(mockCreateWorkspace).toHaveBeenCalledTimes(1);
+
+    // Verify it was called with the correct task ID
+    const callArgs = mockCreateWorkspace.mock.calls[0][0];
+    expect(callArgs.taskId).toBe("task-001");
+  });
+
+  it("runTask writes workspace results to task state fields", async () => {
+    const recipe = createTestRecipe();
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask({
+      recipeId: "test-recipe",
+      repoPath: "/tmp/test-repo",
+    });
+
+    mockCreateWorkspace.mockResolvedValue({
+      success: true,
+      workspacePath: "/tmp/ws/task-001",
+      branchName: "bees/task-001-build-a-widget",
+    });
+
+    const backend = createMockBackend([
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+
+    await runTask(task, recipe, runsDir);
+
+    // Task state should have workspace fields populated
+    expect(task.branchName).toBe("bees/task-001-build-a-widget");
+    expect(task.workspacePath).toBe("/tmp/ws/task-001");
+
+    // Verify fields persisted to disk
+    const loaded = await loadTask(runsDir, task.id);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.branchName).toBe("bees/task-001-build-a-widget");
+    expect(loaded!.workspacePath).toBe("/tmp/ws/task-001");
+  });
+
+  it("runTask skips workspace creation when branchName already set", async () => {
+    const recipe = createTestRecipe();
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask({
+      recipeId: "test-recipe",
+      branchName: "bees/task-001-existing-branch",
+      workspacePath: "/tmp/existing-ws",
+    });
+
+    const backend = createMockBackend([
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+
+    await runTask(task, recipe, runsDir);
+
+    // Workspace creation should NOT have been called (idempotent)
+    expect(mockCreateWorkspace).not.toHaveBeenCalled();
+
+    // Existing values should be preserved
+    expect(task.branchName).toBe("bees/task-001-existing-branch");
+    expect(task.workspacePath).toBe("/tmp/existing-ws");
+  });
+
+  it("runTask handles workspace creation failure gracefully", async () => {
+    const recipe = createTestRecipe();
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask({
+      recipeId: "test-recipe",
+      repoPath: "/tmp/test-repo",
+    });
+
+    mockCreateWorkspace.mockResolvedValue({
+      success: false,
+      error: "Failed to create worktree: branch already exists",
+    });
+
+    const backend = createMockBackend([
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+
+    // Should not throw -- workspace failure should be handled gracefully
+    await runTask(task, recipe, runsDir);
+
+    // Task should still have completed (workspace failure is not fatal)
+    expect(mockCreateWorkspace).toHaveBeenCalledTimes(1);
+    // branchName should not be set on failure
+    expect(task.branchName).toBeUndefined();
   });
 });

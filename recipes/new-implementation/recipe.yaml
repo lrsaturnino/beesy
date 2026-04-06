@@ -15,6 +15,7 @@ orchestrator:
 
 stage_order:
   - planning
+  - commit_and_pr
 
 start_stage: planning
 
@@ -30,7 +31,27 @@ stages:
         format: md
         mirror_to:
           - ".bees/planning.md"
-    allowed_transitions: []
+    allowed_transitions:
+      - commit_and_pr
     allowed_scripts:
       - knowledge.prime
       - implementation.batch_bridge
+
+  # Stage 2: Commit, push, and open a draft PR for the implementation.
+  # All four delivery actions are registered in the script manifest and
+  # validated by the decision validator before execution.
+  commit_and_pr:
+    role: roles/delivery/commit-and-pr.md
+    objective: "Stage changes, create commit, push branch, and open draft PR"
+    inputs:
+      - description: "Planning document from planning stage"
+        source: artifacts.planning_doc
+    outputs:
+      - label: pr_url
+        format: url
+    allowed_transitions: []
+    allowed_scripts:
+      - delivery.stage_explicit
+      - delivery.commit_with_trailers
+      - delivery.push_branch
+      - delivery.upsert_draft_pr

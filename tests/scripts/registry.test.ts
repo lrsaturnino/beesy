@@ -219,6 +219,61 @@ scripts:
     rerun_policy: restart
 `;
 
+const VALID_DELIVERY_ACTIONS_YAML = `
+scripts:
+  - script_id: delivery.stage_explicit
+    description: "Stage specific files in the workspace"
+    runtime: internal
+    path: src/delivery/stage-explicit.ts
+    timeout_ms: 60000
+    retryable: false
+    side_effects: workspace-write
+    required_env: []
+    rerun_policy: restart
+  - script_id: delivery.commit_with_trailers
+    description: "Create a conventional commit with identity trailers"
+    runtime: internal
+    path: src/delivery/commit-with-trailers.ts
+    timeout_ms: 60000
+    retryable: false
+    side_effects: workspace-write
+    required_env: []
+    rerun_policy: refuse
+  - script_id: delivery.push_branch
+    description: "Push a branch to a remote repository"
+    runtime: internal
+    path: src/delivery/push-branch.ts
+    timeout_ms: 60000
+    retryable: true
+    side_effects: external-write
+    required_env:
+      - GITHUB_TOKEN
+    rerun_policy: restart
+  - script_id: delivery.upsert_draft_pr
+    description: "Create or update a GitHub draft pull request"
+    runtime: internal
+    path: src/delivery/upsert-draft-pr.ts
+    timeout_ms: 60000
+    retryable: true
+    side_effects: external-write
+    required_env:
+      - GITHUB_TOKEN
+    rerun_policy: restart
+`;
+
+const VALID_INTERNAL_RUNTIME_YAML = `
+scripts:
+  - script_id: test.internal_action
+    description: "An internal runtime action"
+    runtime: internal
+    path: src/test/internal-action.ts
+    timeout_ms: 30000
+    retryable: false
+    side_effects: read-only
+    required_env: []
+    rerun_policy: restart
+`;
+
 const NO_ORCHESTRATOR_NOTES_YAML = `
 scripts:
   - script_id: with.notes
@@ -622,5 +677,162 @@ describe("YAML Manifest Integration", () => {
     expect(bridge.runtime).toBe("python");
     expect(bridge.side_effects).toBe("workspace-write");
     expect(bridge.timeout_ms).toBeGreaterThan(0);
+  });
+
+  it("actual manifest.yaml contains delivery action entries with internal runtime", async () => {
+    const projectRoot = path.resolve(__dirname, "../..");
+    const manifestPath = path.join(projectRoot, "scripts", "manifest.yaml");
+
+    const registry = await loadScriptRegistry(manifestPath, projectRoot);
+
+    // Delivery actions should be registered alongside existing scripts
+    expect(registry.has("delivery.stage_explicit")).toBe(true);
+    expect(registry.has("delivery.commit_with_trailers")).toBe(true);
+    expect(registry.has("delivery.push_branch")).toBe(true);
+    expect(registry.has("delivery.upsert_draft_pr")).toBe(true);
+
+    // Verify internal runtime on all delivery actions
+    const stageEntry = registry.get("delivery.stage_explicit")!;
+    expect(stageEntry.runtime).toBe("internal");
+
+    const commitEntry = registry.get("delivery.commit_with_trailers")!;
+    expect(commitEntry.runtime).toBe("internal");
+
+    const pushEntry = registry.get("delivery.push_branch")!;
+    expect(pushEntry.runtime).toBe("internal");
+
+    const prEntry = registry.get("delivery.upsert_draft_pr")!;
+    expect(prEntry.runtime).toBe("internal");
+  });
+});
+
+// -------------------------------------------------------------------
+// Shared delivery action test helpers
+// -------------------------------------------------------------------
+
+/** Placeholder script paths that delivery action manifests reference. */
+const DELIVERY_SCRIPT_PATHS = [
+  "src/delivery/stage-explicit.ts",
+  "src/delivery/commit-with-trailers.ts",
+  "src/delivery/push-branch.ts",
+  "src/delivery/upsert-draft-pr.ts",
+];
+
+/**
+ * Write the delivery actions manifest and create placeholder files.
+ * Shared across delivery registration, resolve, and catalog tests.
+ */
+async function writeDeliveryManifest(): Promise<string> {
+  return writeManifest(VALID_DELIVERY_ACTIONS_YAML, DELIVERY_SCRIPT_PATHS);
+}
+
+// -------------------------------------------------------------------
+// Group 7: Delivery Action Registration (internal runtime)
+// -------------------------------------------------------------------
+
+describe("loadScriptRegistry -- Delivery Actions (internal runtime)", () => {
+  it("loads manifest with delivery actions using internal runtime", async () => {
+    const manifestPath = await writeDeliveryManifest();
+    const registry = await loadScriptRegistry(manifestPath, tempDir);
+
+    expect(registry.size).toBe(4);
+    expect(registry.has("delivery.stage_explicit")).toBe(true);
+    expect(registry.has("delivery.commit_with_trailers")).toBe(true);
+    expect(registry.has("delivery.push_branch")).toBe(true);
+    expect(registry.has("delivery.upsert_draft_pr")).toBe(true);
+  });
+
+  it("internal runtime is accepted as valid by the registry loader", async () => {
+    const manifestPath = await writeManifest(VALID_INTERNAL_RUNTIME_YAML, [
+      "src/test/internal-action.ts",
+    ]);
+    const registry = await loadScriptRegistry(manifestPath, tempDir);
+
+    expect(registry.size).toBe(1);
+    expect(registry.has("test.internal_action")).toBe(true);
+
+    const entry = registry.get("test.internal_action")!;
+    expect(entry.runtime).toBe("internal");
+  });
+
+  it("delivery actions have correct side_effects metadata", async () => {
+    const manifestPath = await writeDeliveryManifest();
+    const registry = await loadScriptRegistry(manifestPath, tempDir);
+
+    expect(registry.get("delivery.stage_explicit")!.side_effects).toBe("workspace-write");
+    expect(registry.get("delivery.commit_with_trailers")!.side_effects).toBe("workspace-write");
+    expect(registry.get("delivery.push_branch")!.side_effects).toBe("external-write");
+    expect(registry.get("delivery.upsert_draft_pr")!.side_effects).toBe("external-write");
+  });
+
+  it("delivery actions have correct rerun_policy metadata", async () => {
+    const manifestPath = await writeDeliveryManifest();
+    const registry = await loadScriptRegistry(manifestPath, tempDir);
+
+    expect(registry.get("delivery.stage_explicit")!.rerun_policy).toBe("restart");
+    expect(registry.get("delivery.commit_with_trailers")!.rerun_policy).toBe("refuse");
+    expect(registry.get("delivery.push_branch")!.rerun_policy).toBe("restart");
+    expect(registry.get("delivery.upsert_draft_pr")!.rerun_policy).toBe("restart");
+  });
+});
+
+// -------------------------------------------------------------------
+// Group 8: resolveScript -- Delivery Actions
+// -------------------------------------------------------------------
+
+describe("resolveScript -- Delivery Actions", () => {
+  it("resolveScript finds delivery actions by stable ID", async () => {
+    const manifestPath = await writeDeliveryManifest();
+    const registry = await loadScriptRegistry(manifestPath, tempDir);
+
+    const stageResult = resolveScript(registry, "delivery.stage_explicit");
+    expect(stageResult).not.toBeNull();
+    expect(stageResult!.script_id).toBe("delivery.stage_explicit");
+    expect(stageResult!.runtime).toBe("internal");
+
+    const commitResult = resolveScript(registry, "delivery.commit_with_trailers");
+    expect(commitResult).not.toBeNull();
+    expect(commitResult!.script_id).toBe("delivery.commit_with_trailers");
+    expect(commitResult!.runtime).toBe("internal");
+
+    const pushResult = resolveScript(registry, "delivery.push_branch");
+    expect(pushResult).not.toBeNull();
+    expect(pushResult!.script_id).toBe("delivery.push_branch");
+    expect(pushResult!.side_effects).toBe("external-write");
+
+    const prResult = resolveScript(registry, "delivery.upsert_draft_pr");
+    expect(prResult).not.toBeNull();
+    expect(prResult!.script_id).toBe("delivery.upsert_draft_pr");
+    expect(prResult!.side_effects).toBe("external-write");
+  });
+});
+
+// -------------------------------------------------------------------
+// Group 9: buildCatalogSummary -- Delivery Actions
+// -------------------------------------------------------------------
+
+describe("buildCatalogSummary -- Delivery Actions", () => {
+  it("buildCatalogSummary includes delivery entries with internal runtime", async () => {
+    const manifestPath = await writeDeliveryManifest();
+    const registry = await loadScriptRegistry(manifestPath, tempDir);
+
+    const catalog = buildCatalogSummary(registry);
+    expect(catalog).toHaveLength(4);
+
+    const stageEntry = catalog.find((e) => e.script_id === "delivery.stage_explicit");
+    expect(stageEntry).toBeDefined();
+    expect(stageEntry!.runtime).toBe("internal");
+    expect(stageEntry!.side_effects).toBe("workspace-write");
+
+    const prEntry = catalog.find((e) => e.script_id === "delivery.upsert_draft_pr");
+    expect(prEntry).toBeDefined();
+    expect(prEntry!.runtime).toBe("internal");
+    expect(prEntry!.side_effects).toBe("external-write");
+
+    // Catalog entries must NOT include implementation-private fields
+    const stageAny = stageEntry as Record<string, unknown>;
+    expect(stageAny.path).toBeUndefined();
+    expect(stageAny.required_env).toBeUndefined();
+    expect(stageAny.rerun_policy).toBeUndefined();
   });
 });
