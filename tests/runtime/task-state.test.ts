@@ -315,6 +315,97 @@ describe("Persistence Roundtrip", () => {
 });
 
 // -------------------------------------------------------------------
+// Group 3b: Delivery Metadata Roundtrip
+// -------------------------------------------------------------------
+
+describe("Delivery Metadata Roundtrip", () => {
+  it("roundtrip preserves delivery metadata fields", async () => {
+    const task = createTestTask({
+      branchName: "bees/task-001-my-feature",
+      repoPath: "/repo/path",
+      prUrl: "https://github.com/org/repo/pull/42",
+      prNumber: 42,
+      deliveryStatus: {
+        stage_explicit: "completed",
+        commit_with_trailers: "pending",
+      },
+    });
+    await persistTask(runsDir, task);
+
+    const loaded = await loadTask(runsDir, task.id);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.branchName).toBe("bees/task-001-my-feature");
+    expect(loaded!.repoPath).toBe("/repo/path");
+    expect(loaded!.prUrl).toBe("https://github.com/org/repo/pull/42");
+    expect(loaded!.prNumber).toBe(42);
+    expect(loaded!.deliveryStatus).toEqual({
+      stage_explicit: "completed",
+      commit_with_trailers: "pending",
+    });
+  });
+
+  it("roundtrip handles absent delivery metadata fields (backward compat)", async () => {
+    const task = createTestTask();
+    await persistTask(runsDir, task);
+
+    const loaded = await loadTask(runsDir, task.id);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.branchName).toBeUndefined();
+    expect(loaded!.repoPath).toBeUndefined();
+    expect(loaded!.prUrl).toBeUndefined();
+    expect(loaded!.prNumber).toBeUndefined();
+    expect(loaded!.deliveryStatus).toBeUndefined();
+  });
+
+  it("roundtrip preserves partial delivery metadata", async () => {
+    const task = createTestTask({
+      branchName: "bees/task-001-partial",
+      repoPath: "/repo/partial",
+    });
+    await persistTask(runsDir, task);
+
+    const loaded = await loadTask(runsDir, task.id);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.branchName).toBe("bees/task-001-partial");
+    expect(loaded!.repoPath).toBe("/repo/partial");
+    expect(loaded!.prUrl).toBeUndefined();
+    expect(loaded!.prNumber).toBeUndefined();
+    expect(loaded!.deliveryStatus).toBeUndefined();
+  });
+
+  it("roundtrip preserves deliveryStatus with all status values", async () => {
+    const task = createTestTask({
+      deliveryStatus: {
+        step_a: "completed",
+        step_b: "pending",
+        step_c: "failed",
+      },
+    });
+    await persistTask(runsDir, task);
+
+    const loaded = await loadTask(runsDir, task.id);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.deliveryStatus).toEqual({
+      step_a: "completed",
+      step_b: "pending",
+      step_c: "failed",
+    });
+  });
+
+  it("prNumber survives roundtrip as number (not string)", async () => {
+    const task = createTestTask({
+      prNumber: 42,
+    });
+    await persistTask(runsDir, task);
+
+    const loaded = await loadTask(runsDir, task.id);
+    expect(loaded).not.toBeNull();
+    expect(typeof loaded!.prNumber).toBe("number");
+    expect(loaded!.prNumber).toBe(42);
+  });
+});
+
+// -------------------------------------------------------------------
 // Group 4: enqueueSubtask
 // -------------------------------------------------------------------
 

@@ -51,6 +51,12 @@ export const JOURNAL_ENTRY_TYPES = [
   "script_failed",
   // Script-to-stage data injection
   "script_output_injected",
+  // Delivery pipeline lifecycle
+  "delivery_stage_completed",
+  "delivery_commit_completed",
+  "delivery_push_completed",
+  "delivery_pr_completed",
+  "delivery_failed",
 ] as const;
 
 /** Journal entry type union derived from {@link JOURNAL_ENTRY_TYPES}. */

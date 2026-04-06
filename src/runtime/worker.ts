@@ -20,6 +20,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import type { Task } from "../queue/types.js";
 import type {
   RecipeConfig,
@@ -42,6 +43,7 @@ import { handleStageAgentRun } from "./stage-agent-handler.js";
 import { handleScriptRun } from "./script-handler.js";
 import type { ScriptManifest } from "../scripts/types.js";
 import { DEFAULT_RESUME_TIMEOUT_MS } from "./pause-controller.js";
+import { createWorkspace } from "../utils/workspace.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -941,6 +943,30 @@ export async function runTask(
       kind: "orchestrator_eval",
       stageId: task.currentStageId,
     });
+  }
+
+  // Workspace wiring: create an isolated git worktree for recipe tasks
+  if (task.recipeId && !task.branchName && task.repoPath) {
+    const title = typeof task.payload?.description === "string"
+      ? task.payload.description
+      : task.gate;
+    const worktreePath = path.join(runsDir, task.id, "workspace");
+    const wsResult = await createWorkspace({
+      repoPath: task.repoPath,
+      worktreePath,
+      taskId: task.id,
+      title,
+    });
+    if (wsResult.success) {
+      task.branchName = wsResult.branchName;
+      task.workspacePath = wsResult.workspacePath;
+      await persistTask(runsDir, task);
+      appendJournalEntry(runsDir, task.id, {
+        type: "workspace_created",
+        branchName: wsResult.branchName,
+        workspacePath: wsResult.workspacePath,
+      });
+    }
   }
 
   // Main loop: process subtasks serially until queue empty or terminal state

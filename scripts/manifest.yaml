@@ -43,3 +43,49 @@ scripts:
     required_env: []
     orchestrator_notes: "Run in collect_data stage after health check to compile metrics"
     rerun_policy: restart
+
+  - script_id: delivery.stage_explicit
+    description: "Stage specific files in the workspace"
+    runtime: internal
+    path: src/delivery/stage-explicit.ts
+    timeout_ms: 60000
+    retryable: false
+    side_effects: workspace-write
+    required_env: []
+    orchestrator_notes: "Run in commit_and_pr stage to stage files before committing"
+    rerun_policy: restart
+
+  - script_id: delivery.commit_with_trailers
+    description: "Create a conventional commit with identity trailers"
+    runtime: internal
+    path: src/delivery/commit-with-trailers.ts
+    timeout_ms: 60000
+    retryable: false
+    side_effects: workspace-write
+    required_env: []
+    orchestrator_notes: "Run in commit_and_pr stage after staging to create the commit"
+    rerun_policy: refuse
+
+  - script_id: delivery.push_branch
+    description: "Push a branch to a remote repository"
+    runtime: internal
+    path: src/delivery/push-branch.ts
+    timeout_ms: 60000
+    retryable: true
+    side_effects: external-write
+    required_env:
+      - GITHUB_TOKEN
+    orchestrator_notes: "Run in commit_and_pr stage after commit to push the branch"
+    rerun_policy: restart
+
+  - script_id: delivery.upsert_draft_pr
+    description: "Create or update a GitHub draft pull request"
+    runtime: internal
+    path: src/delivery/upsert-draft-pr.ts
+    timeout_ms: 60000
+    retryable: true
+    side_effects: external-write
+    required_env:
+      - GITHUB_TOKEN
+    orchestrator_notes: "Run in commit_and_pr stage after push to create or update the PR"
+    rerun_policy: restart

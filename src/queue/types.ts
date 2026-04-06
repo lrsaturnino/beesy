@@ -158,6 +158,19 @@ export interface Task {
   /** Error message if task failed. */
   error?: string;
 
+  // -- Delivery metadata fields -----------------------------------------------
+
+  /** Git branch name for this task's workspace. */
+  branchName?: string;
+  /** Path to the base git repository. */
+  repoPath?: string;
+  /** URL of the created or updated pull request. */
+  prUrl?: string;
+  /** Numeric pull request identifier. */
+  prNumber?: number;
+  /** Per-step delivery completion tracking. */
+  deliveryStatus?: Record<string, "completed" | "pending" | "failed">;
+
   // -- Recipe-oriented orchestration fields ------------------------------------
 
   /** Recipe that drives this task (undefined for gate-centric tasks). */

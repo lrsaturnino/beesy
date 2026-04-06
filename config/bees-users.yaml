@@ -1,0 +1,6 @@
+users:
+  - slackUserId: U_EXAMPLE_001
+    slackDisplayName: Example User
+    githubLogin: example-user
+    githubName: Example User
+    githubEmail: example@example.com
