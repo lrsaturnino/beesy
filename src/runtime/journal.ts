@@ -45,6 +45,12 @@ export const JOURNAL_ENTRY_TYPES = [
   "task_completed",
   "task_failed",
   "artifact_registered",
+  // Script execution lifecycle
+  "script_started",
+  "script_completed",
+  "script_failed",
+  // Script-to-stage data injection
+  "script_output_injected",
 ] as const;
 
 /** Journal entry type union derived from {@link JOURNAL_ENTRY_TYPES}. */

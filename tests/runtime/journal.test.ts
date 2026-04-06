@@ -66,6 +66,9 @@ function createEntry(
     task_completed: { summary: "all stages finished successfully" },
     task_failed: { error: "max retries exceeded", lastStageId: "coding" },
     artifact_registered: { artifactId: "artifact-001", label: "planning_doc", stageId: "planning" },
+    script_started: { scriptId: "knowledge.prime", taskId: "task-001", inputHash: "abc123" },
+    script_completed: { scriptId: "knowledge.prime", summary: "knowledge context built", durationMs: 3200 },
+    script_failed: { scriptId: "knowledge.prime", error: "script timed out after 30000ms", exitCode: 1 },
   };
 
   return { type, ...payloads[type], ...extra };
@@ -225,10 +228,10 @@ describe("readJournal -- Deserialization", () => {
 });
 
 // -------------------------------------------------------------------
-// Group 4: All 13 Entry Types
+// Group 4: All 17 Entry Types
 // -------------------------------------------------------------------
 
-describe("All 13 Entry Types", () => {
+describe("All 17 Entry Types", () => {
   const ALL_TYPES: JournalEntryType[] = [
     "task_created",
     "subtask_queued",
@@ -243,10 +246,14 @@ describe("All 13 Entry Types", () => {
     "task_completed",
     "task_failed",
     "artifact_registered",
+    "script_started",
+    "script_completed",
+    "script_failed",
+    "script_output_injected",
   ];
 
-  it("JOURNAL_ENTRY_TYPES contains all 13 types", () => {
-    expect(JOURNAL_ENTRY_TYPES).toHaveLength(13);
+  it("JOURNAL_ENTRY_TYPES contains all 17 types", () => {
+    expect(JOURNAL_ENTRY_TYPES).toHaveLength(17);
     for (const t of ALL_TYPES) {
       expect(JOURNAL_ENTRY_TYPES).toContain(t);
     }
@@ -334,5 +341,27 @@ describe("Append-Only Invariant and Edge Cases", () => {
 
     expect(Array.isArray(result)).toBe(true);
     expect(result).toHaveLength(0);
+  });
+});
+
+// -------------------------------------------------------------------
+// Group 6: Script Execution Entry Types
+// -------------------------------------------------------------------
+
+describe("Script Execution Entry Types", () => {
+  it("JOURNAL_ENTRY_TYPES includes script_started", () => {
+    expect(JOURNAL_ENTRY_TYPES).toContain("script_started");
+  });
+
+  it("JOURNAL_ENTRY_TYPES includes script_completed", () => {
+    expect(JOURNAL_ENTRY_TYPES).toContain("script_completed");
+  });
+
+  it("JOURNAL_ENTRY_TYPES includes script_failed", () => {
+    expect(JOURNAL_ENTRY_TYPES).toContain("script_failed");
+  });
+
+  it("JOURNAL_ENTRY_TYPES has 17 total entry types after script additions", () => {
+    expect(JOURNAL_ENTRY_TYPES).toHaveLength(17);
   });
 });

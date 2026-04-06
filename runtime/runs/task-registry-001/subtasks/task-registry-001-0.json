@@ -1,0 +1,18 @@
+{
+  "id": "task-registry-001-0",
+  "stepId": "init",
+  "name": "orchestrator_eval:init",
+  "executionType": "agent",
+  "status": "active",
+  "cost": {
+    "totalTokens": 0,
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "estimatedCostUsd": 0
+  },
+  "attempt": 1,
+  "maxRetries": 0,
+  "kind": "orchestrator_eval",
+  "stageId": "init",
+  "startedAt": "2026-04-06T18:07:38.685Z"
+}

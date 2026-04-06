@@ -12,7 +12,8 @@
  * recovery.
  *
  * Composes: task-state, journal, orchestrator-context, decision-validator,
- * stage-agent-handler. Delegates stage execution to stage-agent-handler.
+ * stage-agent-handler, script-handler. Delegates stage execution to
+ * stage-agent-handler and script execution to script-handler.
  * Extended by pause/resume controller and recovery module.
  *
  * @module runtime/worker
@@ -38,6 +39,8 @@ import { appendJournalEntry, readJournal } from "./journal.js";
 import { buildOrchestratorContext } from "./orchestrator-context.js";
 import { validateDecision } from "./decision-validator.js";
 import { handleStageAgentRun } from "./stage-agent-handler.js";
+import { handleScriptRun } from "./script-handler.js";
+import type { ScriptManifest } from "../scripts/types.js";
 import { DEFAULT_RESUME_TIMEOUT_MS } from "./pause-controller.js";
 
 // ---------------------------------------------------------------------------
@@ -137,11 +140,44 @@ function summarizeJournal(runsDir: string, taskId: string): string {
 }
 
 /**
+ * Format the script catalog and stage allowlist into a prompt text block.
+ *
+ * Produces two subsections for the `# Task` prompt section: a catalog
+ * listing all registered scripts the orchestrator may reference, and a
+ * concise allowlist of script IDs permitted in the current stage.
+ *
+ * @param catalog        - Script catalog entries from the orchestrator context
+ * @param allowedScripts - Script IDs the orchestrator may invoke in the current stage
+ * @returns Formatted text block ready for appending to the task section
+ */
+function formatScriptContext(
+  catalog: ReturnType<typeof buildOrchestratorContext>["scriptCatalog"],
+  allowedScripts: ReturnType<typeof buildOrchestratorContext>["allowedScripts"],
+): string {
+  let block = `\n\nAvailable Scripts:`;
+
+  if (catalog.length > 0) {
+    for (const entry of catalog) {
+      block += `\n- ${entry.script_id}: ${entry.description} (side_effects=${entry.side_effects}, timeout=${entry.timeout_ms}ms, retryable=${entry.retryable})`;
+      if (entry.orchestrator_notes) {
+        block += `\n  Note: ${entry.orchestrator_notes}`;
+      }
+    }
+  } else {
+    block += ` none`;
+  }
+
+  block += `\n\nAllowed Scripts for This Stage: ${allowedScripts.length > 0 ? allowedScripts.join(", ") : "none"}`;
+
+  return block;
+}
+
+/**
  * Render the orchestrator prompt in the # Role / # Task / # Output format.
  *
  * Produces a three-section markdown prompt consumed by the orchestrator agent:
  * - # Role: behavioral instructions from the role file
- * - # Task: current stage context, budget tracking, journal summary
+ * - # Task: current stage context, budget tracking, script catalog, journal summary
  * - # Output: required JSON decision schema
  *
  * @param roleContent - Content of the orchestrator role file
@@ -182,6 +218,8 @@ function renderOrchestratorPrompt(
     taskSection += `\nPlease provide a valid decision.`;
   }
 
+  taskSection += formatScriptContext(context.scriptCatalog, context.allowedScripts);
+
   taskSection += `\n\nJournal Summary:\n${context.journalSummary}`;
 
   sections.push(taskSection);
@@ -190,11 +228,12 @@ function renderOrchestratorPrompt(
   let outputSection = `# Output\n\nReturn a single JSON object with this schema:`;
   outputSection += `\n\`\`\`json`;
   outputSection += `\n{`;
-  outputSection += `\n  "action": "run_stage_agent" | "pause_for_input" | "finish_run" | "fail_run",`;
+  outputSection += `\n  "action": "run_stage_agent" | "pause_for_input" | "finish_run" | "fail_run" | "run_script",`;
   outputSection += `\n  "target_stage": "stage_id (required for run_stage_agent and pause_for_input)",`;
   outputSection += `\n  "input_patch": { "key": "value (optional, merged into stage inputs)" },`;
   outputSection += `\n  "state_patch": { "key": "value (optional, merged into run state)" },`;
-  outputSection += `\n  "reason": "explanation for this decision"`;
+  outputSection += `\n  "reason": "explanation for this decision",`;
+  outputSection += `\n  "script_id": "script identifier (required for run_script)"`;
   outputSection += `\n}`;
   outputSection += `\n\`\`\``;
 
@@ -357,6 +396,7 @@ async function handleOrchestratorEval(
   subtaskId: string,
   recipe: RecipeConfig,
   runsDir: string,
+  registry?: Map<string, ScriptManifest>,
 ): Promise<void> {
   const roleContent = readRoleFile(recipe.orchestrator.role);
   const orch = recipe.orchestrator;
@@ -378,6 +418,7 @@ async function handleOrchestratorEval(
       latestStageOutput,
       inputPatch,
       journalSummary,
+      registry,
     );
 
     const prompt = renderOrchestratorPrompt(roleContent, context, rejectionReason);
@@ -456,6 +497,7 @@ async function handleOrchestratorEval(
       task.stageRetryCount ?? {},
       task.totalActionCount ?? 0,
       completedOutputLabels,
+      registry,
     );
 
     if (!validation.valid) {
@@ -530,6 +572,7 @@ function findLatestStageOutput(task: Task): string | null {
  *
  * Dispatches on the decision action to perform the appropriate state transition:
  * - run_stage_agent: update stage, increment counters, enqueue stage_agent_run
+ * - run_script: increment counters, enqueue script_run subtask with script_id
  * - finish_run: mark task completed
  * - fail_run: mark task failed
  * - pause_for_input: mark task paused
@@ -619,27 +662,61 @@ async function applyDecision(
       });
       break;
     }
+
+    case "run_script": {
+      // Increment total action count
+      task.totalActionCount = (task.totalActionCount ?? 0) + 1;
+
+      // Apply state_patch if present
+      if (decision.state_patch) {
+        Object.assign(task.payload, decision.state_patch);
+      }
+
+      // Enqueue a script_run subtask with script_id and input_patch in payload
+      const currentStageId = effectiveStage(task, recipe);
+      await enqueueSubtask(runsDir, task, {
+        kind: "script_run",
+        stageId: currentStageId,
+        payload: {
+          script_id: decision.script_id,
+          ...decision.input_patch,
+        },
+      });
+
+      appendJournalEntry(runsDir, task.id, {
+        type: "subtask_queued",
+        subtaskId: task.subtasks![task.subtasks!.length - 1].id,
+        kind: "script_run",
+        stageId: currentStageId,
+      });
+      break;
+    }
   }
 }
 
 /**
- * Record a stage_agent_run subtask failure and enqueue the next orchestrator eval.
+ * Record a subtask failure and enqueue the next orchestrator eval.
  *
  * Centralizes the failure-handling sequence shared by the caught-exception path
- * and the returned-error path in {@link handleStageAgent}. Marks the subtask
- * failed, journals the failure, and enqueues an orchestrator_eval so the
- * orchestrator can decide how to recover.
+ * and the returned-error path in handler functions. Marks the subtask failed,
+ * journals the failure with the subtask kind, and enqueues an orchestrator_eval
+ * so the orchestrator can decide how to recover.
+ *
+ * Used by both {@link handleStageAgent} and {@link handleScriptRunSubtask} to
+ * avoid duplicating the mark-journal-enqueue failure sequence.
  *
  * @param task      - Parent task being executed
  * @param subtaskId - Identifier of the failed subtask
  * @param error     - Error message describing the failure
+ * @param kind      - Subtask kind for journal attribution (e.g. "stage_agent_run", "script_run")
  * @param recipe    - Recipe configuration
  * @param runsDir   - Base directory for task run data
  */
-async function recordStageFailure(
+async function recordSubtaskFailure(
   task: Task,
   subtaskId: string,
   error: string,
+  kind: string,
   recipe: RecipeConfig,
   runsDir: string,
 ): Promise<void> {
@@ -648,11 +725,35 @@ async function recordStageFailure(
   appendJournalEntry(runsDir, task.id, {
     type: "subtask_failed",
     subtaskId,
-    kind: "stage_agent_run",
+    kind,
     error,
   });
 
   await enqueueOrchestratorEval(task, recipe, runsDir);
+}
+
+/**
+ * Store artifact IDs on both the subtask and the parent task.
+ *
+ * Appends new artifact identifiers produced by a handler to the subtask's
+ * and parent task's artifact arrays. Skips when the artifact list is empty.
+ *
+ * Used by both {@link handleStageAgent} and {@link handleScriptRunSubtask}
+ * to avoid duplicating the push-to-both-levels artifact storage logic.
+ *
+ * @param task     - Parent task that accumulates all artifacts
+ * @param subtask  - Subtask that produced the artifacts
+ * @param artifactIds - Artifact identifiers to store
+ */
+function storeArtifacts(
+  task: Task,
+  subtask: { artifactIds?: string[] },
+  artifactIds: string[],
+): void {
+  if (artifactIds.length === 0) return;
+  subtask.artifactIds = artifactIds;
+  if (!task.artifactIds) task.artifactIds = [];
+  task.artifactIds.push(...artifactIds);
 }
 
 /**
@@ -680,29 +781,82 @@ async function handleStageAgent(
     result = await handleStageAgentRun(task, subtask, recipe, runsDir);
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : String(err);
-    await recordStageFailure(task, subtaskId, errorMsg, recipe, runsDir);
+    await recordSubtaskFailure(task, subtaskId, errorMsg, "stage_agent_run", recipe, runsDir);
     return;
   }
 
   if (result.error) {
-    await recordStageFailure(task, subtaskId, result.error, recipe, runsDir);
+    await recordSubtaskFailure(task, subtaskId, result.error, "stage_agent_run", recipe, runsDir);
     return;
   }
 
   // Mark subtask completed with output
   await markSubtaskComplete(runsDir, task, subtaskId, result.output);
 
-  // Store artifact IDs on the subtask
-  if (result.artifactIds.length > 0) {
-    subtask.artifactIds = result.artifactIds;
-    if (!task.artifactIds) task.artifactIds = [];
-    task.artifactIds.push(...result.artifactIds);
-  }
+  storeArtifacts(task, subtask, result.artifactIds);
 
   appendJournalEntry(runsDir, task.id, {
     type: "subtask_completed",
     subtaskId,
     kind: "stage_agent_run",
+    output: result.output?.slice(0, 200),
+  });
+
+  // Enqueue the next orchestrator_eval
+  await enqueueOrchestratorEval(task, recipe, runsDir);
+}
+
+/**
+ * Handle a script_run subtask.
+ *
+ * Delegates execution to handleScriptRun from the script handler module,
+ * marks the subtask as completed or failed based on the result, merges
+ * any statePatch into the task payload, stores artifact IDs, and enqueues
+ * the next orchestrator_eval so the orchestrator can decide what happens next.
+ *
+ * @param task      - Parent task being executed
+ * @param subtaskId - Identifier of the script_run subtask
+ * @param registry  - Script registry Map for manifest resolution
+ * @param recipe    - Recipe configuration
+ * @param runsDir   - Base directory for task run data
+ */
+async function handleScriptRunSubtask(
+  task: Task,
+  subtaskId: string,
+  registry: Map<string, ScriptManifest>,
+  recipe: RecipeConfig,
+  runsDir: string,
+): Promise<void> {
+  const subtask = task.subtasks!.find((s) => s.id === subtaskId)!;
+
+  let result;
+  try {
+    result = await handleScriptRun(task, subtask, registry, runsDir);
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    await recordSubtaskFailure(task, subtaskId, errorMsg, "script_run", recipe, runsDir);
+    return;
+  }
+
+  if (result.error) {
+    await recordSubtaskFailure(task, subtaskId, result.error, "script_run", recipe, runsDir);
+    return;
+  }
+
+  // Mark subtask completed with output
+  await markSubtaskComplete(runsDir, task, subtaskId, result.output);
+
+  // Merge statePatch into task payload when present
+  if (result.statePatch) {
+    Object.assign(task.payload, result.statePatch);
+  }
+
+  storeArtifacts(task, subtask, result.artifactIds);
+
+  appendJournalEntry(runsDir, task.id, {
+    type: "subtask_completed",
+    subtaskId,
+    kind: "script_run",
     output: result.output?.slice(0, 200),
   });
 
@@ -759,14 +913,16 @@ async function enqueueOrchestratorEval(
  * - No more subtasks are queued (dequeueNext returns null)
  * - Task status transitions to completed, failed, or paused
  *
- * @param task    - The task to execute (mutated in place throughout execution)
- * @param recipe  - Recipe configuration driving the execution
- * @param runsDir - Base directory for task run data persistence
+ * @param task     - The task to execute (mutated in place throughout execution)
+ * @param recipe   - Recipe configuration driving the execution
+ * @param runsDir  - Base directory for task run data persistence
+ * @param registry - Script registry for script_run dispatch (optional for backward compatibility)
  */
 export async function runTask(
   task: Task,
   recipe: RecipeConfig,
   runsDir: string,
+  registry?: Map<string, ScriptManifest>,
 ): Promise<void> {
   // Initialize: enqueue first orchestrator_eval if no subtasks queued
   if (!task.queuedSubtaskIds || task.queuedSubtaskIds.length === 0) {
@@ -805,11 +961,21 @@ export async function runTask(
     // Dispatch by subtask kind
     switch (subtask.kind) {
       case "orchestrator_eval":
-        await handleOrchestratorEval(task, subtask.id, recipe, runsDir);
+        await handleOrchestratorEval(task, subtask.id, recipe, runsDir, registry);
         break;
 
       case "stage_agent_run":
         await handleStageAgent(task, subtask.id, recipe, runsDir);
+        break;
+
+      case "script_run":
+        if (!registry) {
+          await recordSubtaskFailure(
+            task, subtask.id, "Script registry not available", "script_run", recipe, runsDir,
+          );
+        } else {
+          await handleScriptRunSubtask(task, subtask.id, registry, recipe, runsDir);
+        }
         break;
 
       case "resume_after_input": {

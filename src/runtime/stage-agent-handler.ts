@@ -47,6 +47,22 @@ export interface StageAgentResult {
 }
 
 // ---------------------------------------------------------------------------
+// Script output result type
+// ---------------------------------------------------------------------------
+
+/** Structured output extracted from a completed `script_run` subtask. */
+export interface ScriptOutputResult {
+  /** Summary text from the script execution (subtask output field). */
+  summary: string;
+  /** Identifier of the script that produced this output. */
+  scriptId: string;
+  /** Identifier of the subtask that executed the script. */
+  subtaskId: string;
+  /** Original subtask payload for traceability. */
+  payload?: Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
@@ -107,6 +123,143 @@ function effectiveStageId(subtask: Subtask): string {
   return subtask.stageId ?? subtask.stepId;
 }
 
+/**
+ * Render a resolved input value as a human-friendly string for prompt
+ * inclusion.
+ *
+ * Script output results (objects with a `summary` field produced by
+ * `findLatestScriptOutput`) are rendered using their summary text, which
+ * is the meaningful content for the stage agent. Other objects are
+ * serialized via `JSON.stringify`. Primitives and null use `String()`.
+ *
+ * @param value - Any resolved input value
+ * @returns String representation suitable for prompt rendering
+ */
+function renderInputValue(value: unknown): string {
+  if (value === null || typeof value !== "object") return String(value);
+
+  // Render script output results by their summary for readability
+  const record = value as Record<string, unknown>;
+  if (typeof record.summary === "string" && typeof record.scriptId === "string") {
+    return record.summary;
+  }
+
+  return JSON.stringify(value);
+}
+
+/**
+ * Detect whether a value is a script output reference sentinel.
+ *
+ * The orchestrator uses `{ _script_output: "script.id" }` as a sentinel
+ * object in `input_patch` to indicate that the value should be resolved
+ * from the most recent completed script_run subtask with the given
+ * script_id. This type guard checks for that exact shape.
+ *
+ * @param value - Any value from the inputPatch
+ * @returns True if the value is a script output reference sentinel
+ */
+function isScriptOutputReference(
+  value: unknown,
+): value is { _script_output: string } {
+  if (value === null || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return typeof record._script_output === "string";
+}
+
+// ---------------------------------------------------------------------------
+// Script output lookup
+// ---------------------------------------------------------------------------
+
+/**
+ * Locate the most recent completed `script_run` subtask for a given script_id.
+ *
+ * Scans `task.subtasks` in reverse order (most recent first) and returns
+ * structured output from the first completed `script_run` subtask whose
+ * `payload.script_id` matches the requested scriptId.
+ *
+ * Returns `null` when no matching completed subtask exists, or when the
+ * task has no subtasks array. Never throws.
+ *
+ * @param task     - Parent task containing the subtasks array
+ * @param scriptId - Script identifier to match against subtask payload
+ * @returns Structured script output, or null if no match found
+ */
+export function findLatestScriptOutput(
+  task: Task,
+  scriptId: string,
+): ScriptOutputResult | null {
+  if (!task.subtasks) return null;
+
+  for (let i = task.subtasks.length - 1; i >= 0; i--) {
+    const subtask = task.subtasks[i];
+    const subtaskScriptId =
+      (subtask.payload as Record<string, unknown> | undefined)?.script_id;
+
+    if (
+      subtask.kind === "script_run" &&
+      subtask.status === "completed" &&
+      subtaskScriptId === scriptId
+    ) {
+      return {
+        summary: subtask.output ?? "",
+        scriptId,
+        subtaskId: subtask.id,
+        payload: subtask.payload,
+      };
+    }
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Script reference resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Replace script output reference sentinels in the resolved map with actual
+ * script outputs from completed `script_run` subtasks.
+ *
+ * Iterates all keys in the resolved map, detects `{ _script_output: "..." }`
+ * sentinel values, and replaces each with the structured output from the most
+ * recent completed `script_run` subtask matching the referenced script_id.
+ * When no matching subtask exists, the sentinel is replaced with `null`.
+ *
+ * When `journalContext` is provided and a reference resolves successfully,
+ * appends a `script_output_injected` journal entry for auditability.
+ *
+ * Mutates the `resolved` map in place and returns it for chaining convenience.
+ *
+ * @param resolved       - Flat map of resolved input values (mutated in place)
+ * @param task           - Task whose subtasks provide script outputs
+ * @param journalContext - Optional context for journal traceability
+ * @returns The same `resolved` map with script references replaced
+ */
+function resolveScriptReferences(
+  resolved: Record<string, unknown>,
+  task: Task,
+  journalContext?: { runsDir: string; taskId: string },
+): Record<string, unknown> {
+  for (const key of Object.keys(resolved)) {
+    if (!isScriptOutputReference(resolved[key])) continue;
+
+    const ref = resolved[key] as { _script_output: string };
+    const scriptOutput = findLatestScriptOutput(task, ref._script_output);
+    resolved[key] = scriptOutput;
+
+    if (journalContext && scriptOutput) {
+      appendJournalEntry(journalContext.runsDir, journalContext.taskId, {
+        type: "script_output_injected",
+        scriptId: ref._script_output,
+        targetKey: key,
+        sourceSubtaskId: scriptOutput.subtaskId,
+      });
+    }
+  }
+
+  return resolved;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -122,18 +275,28 @@ function effectiveStageId(subtask: Subtask): string {
  *
  * When an `inputPatch` is provided, its values are merged on top using
  * spread semantics -- patch keys win on conflicts with source-resolved keys.
+ * After merging, any values that match the `{ _script_output: "script.id" }`
+ * sentinel pattern are resolved by looking up the most recent completed
+ * `script_run` subtask for the referenced script_id.
+ *
+ * When `journalContext` is provided and script references are resolved,
+ * a `script_output_injected` journal entry is appended for each resolved
+ * reference for auditability.
  *
  * This function never throws. Missing source paths resolve to `undefined`.
+ * Unresolvable script references resolve to `null`.
  *
- * @param stage      - Stage definition containing the inputs array
- * @param task       - Task whose state provides the resolution context
- * @param inputPatch - Optional key-value overrides from the orchestrator decision
+ * @param stage          - Stage definition containing the inputs array
+ * @param task           - Task whose state provides the resolution context
+ * @param inputPatch     - Optional key-value overrides from the orchestrator decision
+ * @param journalContext - Optional context for journal traceability of script output injection
  * @returns Flat map of resolved input values
  */
 export function resolveInputs(
   stage: StageDefinition,
   task: Task,
   inputPatch?: Record<string, unknown>,
+  journalContext?: { runsDir: string; taskId: string },
 ): Record<string, unknown> {
   const context: Record<string, unknown> = { task };
   const resolved: Record<string, unknown> = {};
@@ -147,7 +310,7 @@ export function resolveInputs(
     Object.assign(resolved, inputPatch);
   }
 
-  return resolved;
+  return resolveScriptReferences(resolved, task, journalContext);
 }
 
 /**
@@ -181,7 +344,7 @@ export function renderPrompt(
   if (inputEntries.length > 0) {
     taskSection += "\n\n## Inputs\n";
     for (const [key, value] of inputEntries) {
-      taskSection += `\n**${key}**: ${String(value)}`;
+      taskSection += `\n**${key}**: ${renderInputValue(value)}`;
     }
   }
   sections.push(taskSection);
@@ -349,7 +512,7 @@ export async function handleStageAgentRun(
   }
 
   const inputPatch = subtask.payload as Record<string, unknown> | undefined;
-  const resolvedInputs = resolveInputs(stage, task, inputPatch);
+  const resolvedInputs = resolveInputs(stage, task, inputPatch, { runsDir, taskId: task.id });
 
   const prompt = renderPrompt(
     roleContent,

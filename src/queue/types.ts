@@ -60,6 +60,7 @@ export const SUBTASK_KINDS = [
   "orchestrator_eval",
   "stage_agent_run",
   "resume_after_input",
+  "script_run",
 ] as const;
 
 /** Subtask kind union type derived from {@link SUBTASK_KINDS}. */

@@ -2,9 +2,16 @@
  * Orchestrator decision validator for recipe policy enforcement.
  *
  * Validates every orchestrator decision against the recipe configuration
- * before any side effect occurs. Enforces transition legality, per-stage
- * retry budgets, total action budgets, finish-run output completeness,
- * and structural requirements (run_stage_agent must have a target_stage).
+ * before any side effect occurs. Enforces eight rules in order:
+ *
+ *   1. run_stage_agent requires a non-empty target_stage
+ *   2. target_stage must be in the current stage's allowed_transitions
+ *   3. Per-stage retry count must be below max_stage_retries
+ *   4. Total action count must be below max_total_actions
+ *   5. finish_run requires all current stage outputs to be produced
+ *   6. run_script requires a non-empty script_id
+ *   7. run_script script_id must exist in the registry and stage allowlist
+ *   8. run_script required environment variables must be present
  *
  * Returns a discriminated union: valid decisions pass through unchanged,
  * invalid decisions produce a descriptive reason string containing all
@@ -22,6 +29,8 @@ import type {
   RecipeConfig,
   StageDefinition,
 } from "../recipes/types.js";
+import type { ScriptManifest } from "../scripts/types.js";
+import { resolveScript, validateEnvRequirements } from "../scripts/registry.js";
 
 // ---------------------------------------------------------------------------
 // Result type
@@ -134,21 +143,96 @@ function checkFinishRunOutputs(
 }
 
 // ---------------------------------------------------------------------------
+// Script validation helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Check that a run_script decision includes a non-empty script_id.
+ * Other action types are not subject to this rule.
+ */
+function checkScriptIdPresent(decision: OrchestratorDecision): string | null {
+  if (decision.action !== "run_script") return null;
+  if (decision.script_id) return null;
+
+  return "run_script requires a script_id but none was provided";
+}
+
+/**
+ * Check that the script_id exists in the registry and is in the current
+ * stage's allowed_scripts list. Skips validation when no registry is
+ * provided (backward compatibility) or when the decision lacks a script_id
+ * (caught by checkScriptIdPresent).
+ */
+function checkScriptAllowlist(
+  decision: OrchestratorDecision,
+  registry: Map<string, ScriptManifest> | undefined,
+  currentStage: StageDefinition | undefined,
+): string | null {
+  if (decision.action !== "run_script" || !decision.script_id || !registry) {
+    return null;
+  }
+
+  const manifest = resolveScript(registry, decision.script_id);
+  if (!manifest) {
+    return `Script '${decision.script_id}' not found in registry`;
+  }
+
+  const allowedScripts = currentStage?.allowed_scripts ?? [];
+  if (!allowedScripts.includes(decision.script_id)) {
+    return (
+      `Script '${decision.script_id}' is not in allowed_scripts ` +
+      `for stage; allowed: ${allowedScripts.length > 0 ? allowedScripts.join(", ") : "(none)"}`
+    );
+  }
+
+  return null;
+}
+
+/**
+ * Check that all required environment variables for the script are present.
+ * Delegates to the registry's validateEnvRequirements function. Skips when
+ * no registry is provided or when the decision lacks a script_id.
+ */
+function checkScriptEnvRequirements(
+  decision: OrchestratorDecision,
+  registry: Map<string, ScriptManifest> | undefined,
+): string | null {
+  if (decision.action !== "run_script" || !decision.script_id || !registry) {
+    return null;
+  }
+
+  const envResult = validateEnvRequirements(registry, decision.script_id);
+  if (!envResult || envResult.valid) return null;
+
+  return (
+    `Script '${decision.script_id}' requires missing environment variables: ` +
+    envResult.missing.join(", ")
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /**
  * Validate an orchestrator decision against recipe policy.
  *
- * Runs five rule checks in order, collecting all violations before returning.
- * Each rule is an independent predicate that returns either a violation
- * description or null when the decision satisfies the rule:
+ * Runs eight rule checks in order, collecting all violations before
+ * returning. Each rule is an independent predicate that returns either
+ * a violation description or null when the decision satisfies the rule:
  *
  * 1. run_stage_agent requires a non-empty target_stage
  * 2. target_stage must be in the current stage's allowed_transitions
  * 3. Per-stage retry count must be below max_stage_retries
  * 4. Total action count must be below max_total_actions
  * 5. finish_run requires all current stage outputs to be produced
+ * 6. run_script requires a non-empty script_id
+ * 7. run_script script_id must exist in the registry and stage allowlist
+ * 8. run_script required environment variables must be present
+ *
+ * Rules 6-8 only fire when a registry is provided. When the registry
+ * parameter is omitted, script validation is skipped for backward
+ * compatibility with callers that do not have access to the registry.
  *
  * @param decision              - The orchestrator decision to validate
  * @param recipe                - Recipe configuration providing stage definitions and budget limits
@@ -156,6 +240,7 @@ function checkFinishRunOutputs(
  * @param retryCounts           - Per-stage retry counters keyed by stage identifier
  * @param totalActionCount      - Running count of orchestrator decisions for this task
  * @param completedOutputLabels - Output labels already produced (for finish_run validation)
+ * @param registry              - Script registry for run_script validation (optional for backward compatibility)
  * @returns Valid result with the original decision, or invalid result with all violations
  */
 export function validateDecision(
@@ -165,6 +250,7 @@ export function validateDecision(
   retryCounts: Record<string, number>,
   totalActionCount: number,
   completedOutputLabels?: ReadonlySet<string>,
+  registry?: Map<string, ScriptManifest>,
 ): ValidationResult {
   const currentStage = recipe.stages[currentStageId];
   const allowedTransitions = currentStage?.allowed_transitions ?? [];
@@ -176,6 +262,9 @@ export function validateDecision(
     checkRetryBudget(decision, retryCounts, recipe.orchestrator.max_stage_retries),
     checkTotalActionBudget(totalActionCount, recipe.orchestrator.max_total_actions),
     checkFinishRunOutputs(decision, currentStage, completed),
+    checkScriptIdPresent(decision),
+    checkScriptAllowlist(decision, registry, currentStage),
+    checkScriptEnvRequirements(decision, registry),
   ].filter((v): v is string => v !== null);
 
   if (violations.length === 0) {

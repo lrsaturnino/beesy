@@ -22,6 +22,7 @@ import {
   executeStageAgent,
   normalizeOutput,
   handleStageAgentRun,
+  findLatestScriptOutput,
 } from "../../src/runtime/stage-agent-handler.js";
 
 import type { Task, Subtask } from "../../src/queue/types.js";
@@ -37,7 +38,7 @@ import type {
   AgentBackend,
   AgentConfig,
 } from "../../src/runners/types.js";
-import { readJournal } from "../../src/runtime/journal.js";
+import { readJournal, appendJournalEntry } from "../../src/runtime/journal.js";
 
 // ---------------------------------------------------------------
 // Shared helpers and fixtures
@@ -721,5 +722,343 @@ describe("Integration -- Full Handler Flow", () => {
     await expect(
       handleStageAgentRun(task, subtask, recipe, runsDir),
     ).rejects.toThrow("CLI worker timeout after 120s");
+  });
+});
+
+// ---------------------------------------------------------------
+// Shared helper: create a completed script_run subtask fixture
+// ---------------------------------------------------------------
+
+/** Factory for a completed script_run subtask with configurable script_id and output. */
+function createScriptRunSubtask(overrides?: Partial<Subtask>): Subtask {
+  return {
+    id: "task-001-script-0",
+    stepId: "planning",
+    name: "script_run:knowledge.prime",
+    executionType: "script",
+    status: "completed",
+    cost: zeroCost(),
+    attempt: 1,
+    maxRetries: 0,
+    kind: "script_run",
+    stageId: "planning",
+    payload: { script_id: "knowledge.prime" },
+    output: "Knowledge context primed successfully",
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------
+// Group 8: findLatestScriptOutput -- Script Output Lookup
+// ---------------------------------------------------------------
+
+describe("findLatestScriptOutput -- Script Output Lookup", () => {
+  it("returns structured output from latest completed script_run subtask", () => {
+    const scriptSubtask = createScriptRunSubtask({
+      id: "task-001-script-1",
+      payload: { script_id: "knowledge.prime" },
+      output: "Knowledge context primed successfully",
+    });
+    const task = createTestTask({ subtasks: [scriptSubtask] });
+
+    const result = findLatestScriptOutput(task, "knowledge.prime");
+
+    expect(result).not.toBeNull();
+    expect(result!.summary).toBe("Knowledge context primed successfully");
+    expect(result!.scriptId).toBe("knowledge.prime");
+    expect(result!.subtaskId).toBe("task-001-script-1");
+  });
+
+  it("returns null when no matching script_run subtask exists", () => {
+    const scriptSubtask = createScriptRunSubtask({
+      payload: { script_id: "data.extract" },
+      output: "Data extracted",
+    });
+    const task = createTestTask({ subtasks: [scriptSubtask] });
+
+    const result = findLatestScriptOutput(task, "knowledge.prime");
+
+    expect(result).toBeNull();
+  });
+
+  it("returns null when subtasks array is empty or undefined", () => {
+    const taskEmpty = createTestTask({ subtasks: [] });
+    const taskUndefined = createTestTask({ subtasks: undefined });
+
+    expect(findLatestScriptOutput(taskEmpty, "knowledge.prime")).toBeNull();
+    expect(findLatestScriptOutput(taskUndefined, "knowledge.prime")).toBeNull();
+  });
+
+  it("returns the most recent match when multiple completed script_runs exist", () => {
+    const older = createScriptRunSubtask({
+      id: "task-001-script-1",
+      payload: { script_id: "knowledge.prime" },
+      output: "First run output",
+    });
+    const newer = createScriptRunSubtask({
+      id: "task-001-script-3",
+      payload: { script_id: "knowledge.prime" },
+      output: "Second run output",
+    });
+    const task = createTestTask({ subtasks: [older, newer] });
+
+    const result = findLatestScriptOutput(task, "knowledge.prime");
+
+    expect(result).not.toBeNull();
+    expect(result!.summary).toBe("Second run output");
+    expect(result!.subtaskId).toBe("task-001-script-3");
+  });
+
+  it("ignores script_run subtasks that are not completed", () => {
+    const failedSubtask = createScriptRunSubtask({
+      id: "task-001-script-1",
+      status: "failed",
+      payload: { script_id: "knowledge.prime" },
+      output: "Failed output",
+    });
+    const pendingSubtask = createScriptRunSubtask({
+      id: "task-001-script-2",
+      status: "pending",
+      payload: { script_id: "knowledge.prime" },
+      output: undefined,
+    });
+    const task = createTestTask({ subtasks: [failedSubtask, pendingSubtask] });
+
+    const result = findLatestScriptOutput(task, "knowledge.prime");
+
+    expect(result).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------
+// Group 9: resolveInputs -- Script Output Reference Resolution
+// ---------------------------------------------------------------
+
+describe("resolveInputs -- Script Output Reference Resolution", () => {
+  it("resolves _script_output reference from inputPatch", () => {
+    const scriptSubtask = createScriptRunSubtask({
+      payload: { script_id: "some.script" },
+      output: "Resolved script summary text",
+    });
+    const stage = createStageDefinition({
+      inputs: [createStageInput({ source: "task.payload.description" })],
+    });
+    const task = createTestTask({
+      payload: { description: "build a widget" },
+      subtasks: [scriptSubtask],
+    });
+    const inputPatch = { knowledge: { _script_output: "some.script" } };
+
+    const result = resolveInputs(stage, task, inputPatch);
+
+    expect(result.description).toBe("build a widget");
+    expect(result.knowledge).not.toBeNull();
+    expect(typeof result.knowledge).toBe("object");
+    expect((result.knowledge as Record<string, unknown>).summary).toBe(
+      "Resolved script summary text",
+    );
+  });
+
+  it("passes through non-reference inputPatch values unchanged", () => {
+    const stage = createStageDefinition({
+      inputs: [createStageInput({ source: "task.payload.description" })],
+    });
+    const task = createTestTask({ payload: { description: "build a widget" } });
+    const inputPatch = {
+      context: "plain string",
+      count: 42,
+      nested: { foo: "bar" },
+    };
+
+    const result = resolveInputs(stage, task, inputPatch);
+
+    expect(result.context).toBe("plain string");
+    expect(result.count).toBe(42);
+    expect(result.nested).toEqual({ foo: "bar" });
+  });
+
+  it("resolves to null when referenced script has no completed output", () => {
+    const stage = createStageDefinition({
+      inputs: [createStageInput({ source: "task.payload.description" })],
+    });
+    const task = createTestTask({
+      payload: { description: "build a widget" },
+      subtasks: [],
+    });
+    const inputPatch = { data: { _script_output: "nonexistent.script" } };
+
+    const result = resolveInputs(stage, task, inputPatch);
+
+    expect(result.data).toBeNull();
+  });
+
+  it("handles multiple script output references in the same inputPatch", () => {
+    const scriptA = createScriptRunSubtask({
+      id: "task-001-script-a",
+      payload: { script_id: "script.alpha" },
+      output: "Alpha output",
+    });
+    const scriptB = createScriptRunSubtask({
+      id: "task-001-script-b",
+      payload: { script_id: "script.beta" },
+      output: "Beta output",
+    });
+    const stage = createStageDefinition({
+      inputs: [createStageInput({ source: "task.payload.description" })],
+    });
+    const task = createTestTask({
+      payload: { description: "build a widget" },
+      subtasks: [scriptA, scriptB],
+    });
+    const inputPatch = {
+      alpha_data: { _script_output: "script.alpha" },
+      beta_data: { _script_output: "script.beta" },
+    };
+
+    const result = resolveInputs(stage, task, inputPatch);
+
+    expect((result.alpha_data as Record<string, unknown>).summary).toBe("Alpha output");
+    expect((result.beta_data as Record<string, unknown>).summary).toBe("Beta output");
+  });
+
+  it("existing resolveInputs behavior unchanged when no script references present", () => {
+    const stage = createStageDefinition({
+      inputs: [createStageInput({ source: "task.payload.description" })],
+    });
+    const task = createTestTask({ payload: { description: "build a widget" } });
+    const inputPatch = { extra_context: "additional notes" };
+
+    const result = resolveInputs(stage, task, inputPatch);
+
+    expect(result.description).toBe("build a widget");
+    expect(result.extra_context).toBe("additional notes");
+  });
+});
+
+// ---------------------------------------------------------------
+// Group 10: resolveInputs -- Script Output Injection Traceability
+// ---------------------------------------------------------------
+
+describe("resolveInputs -- Script Output Injection Traceability", () => {
+  it("appends journal entry when script output reference is resolved", async () => {
+    const scriptSubtask = createScriptRunSubtask({
+      payload: { script_id: "knowledge.prime" },
+      output: "Primed context",
+    });
+    const stage = createStageDefinition({
+      inputs: [createStageInput({ source: "task.payload.description" })],
+    });
+    const task = createTestTask({
+      payload: { description: "build a widget" },
+      subtasks: [scriptSubtask],
+    });
+    const inputPatch = { knowledge: { _script_output: "knowledge.prime" } };
+    await createTaskRunDir(task.id);
+
+    resolveInputs(stage, task, inputPatch, { runsDir, taskId: task.id });
+
+    const journal = readJournal(runsDir, task.id);
+    const injectionEntries = journal.filter(
+      (e) => e.type === "script_output_injected",
+    );
+    expect(injectionEntries.length).toBe(1);
+    expect(injectionEntries[0]).toHaveProperty("scriptId", "knowledge.prime");
+  });
+
+  it("skips journal when journalContext is not provided", async () => {
+    const scriptSubtask = createScriptRunSubtask({
+      payload: { script_id: "knowledge.prime" },
+      output: "Primed context",
+    });
+    const stage = createStageDefinition({
+      inputs: [createStageInput({ source: "task.payload.description" })],
+    });
+    const task = createTestTask({
+      payload: { description: "build a widget" },
+      subtasks: [scriptSubtask],
+    });
+    const inputPatch = { knowledge: { _script_output: "knowledge.prime" } };
+    await createTaskRunDir(task.id);
+
+    resolveInputs(stage, task, inputPatch);
+
+    const journal = readJournal(runsDir, task.id);
+    expect(journal.length).toBe(0);
+  });
+
+  it("journal entry records injection details for auditability", async () => {
+    const scriptSubtask = createScriptRunSubtask({
+      id: "task-001-script-audit",
+      payload: { script_id: "data.extract" },
+      output: "Extracted data summary",
+    });
+    const stage = createStageDefinition({
+      inputs: [createStageInput({ source: "task.payload.description" })],
+    });
+    const task = createTestTask({
+      payload: { description: "build a widget" },
+      subtasks: [scriptSubtask],
+    });
+    const inputPatch = { extracted: { _script_output: "data.extract" } };
+    await createTaskRunDir(task.id);
+
+    resolveInputs(stage, task, inputPatch, { runsDir, taskId: task.id });
+
+    const journal = readJournal(runsDir, task.id);
+    const entry = journal.find((e) => e.type === "script_output_injected");
+    expect(entry).toBeDefined();
+    expect(entry!.scriptId).toBe("data.extract");
+    expect(entry!.targetKey).toBe("extracted");
+    expect(entry!.sourceSubtaskId).toBe("task-001-script-audit");
+  });
+});
+
+// ---------------------------------------------------------------
+// Group 11: Integration -- Script Result Injection via handleStageAgentRun
+// ---------------------------------------------------------------
+
+describe("Integration -- Script Result Injection via handleStageAgentRun", () => {
+  it("handleStageAgentRun merges script output into stage-agent resolved inputs", async () => {
+    const roleContent = "You are a coding specialist.";
+    const rolePath = path.join(runsDir, "roles", "coder.md");
+    await writeRoleFile(rolePath, roleContent);
+
+    const scriptSubtask = createScriptRunSubtask({
+      id: "task-001-script-prime",
+      payload: { script_id: "knowledge.prime" },
+      output: "Primed knowledge context for coding",
+    });
+    const stage = createStageDefinition({
+      role: rolePath,
+      objective: "Implement the feature",
+      inputs: [createStageInput({ source: "task.payload.description" })],
+      outputs: [createStageOutput({ label: "code_output", format: "ts" })],
+    });
+    const recipe = createRecipeConfig({ stages: { coding: stage } });
+    const task = createTestTask({
+      payload: { description: "build a widget" },
+      subtasks: [scriptSubtask],
+    });
+    const subtask = createSubtask({
+      stageId: "coding",
+      payload: { knowledge: { _script_output: "knowledge.prime" } },
+    });
+    await createTaskRunDir(task.id);
+
+    const expectedOutput = makeStepOutput({ output: "Generated code" });
+    const backend = makeStubBackend("cli-claude", expectedOutput);
+    mockResolveAgentBackend.mockReturnValue(backend);
+
+    await handleStageAgentRun(task, subtask, recipe, runsDir);
+
+    expect(backend.run).toHaveBeenCalledOnce();
+    const [passedConfig] = (backend.run as ReturnType<typeof vi.fn>).mock.calls[0];
+    const systemPrompt = passedConfig.systemPrompt as string;
+
+    // The rendered prompt should contain the resolved script output summary,
+    // not the raw reference object serialized as "[object Object]" or JSON
+    expect(systemPrompt).toContain("Primed knowledge context for coding");
+    expect(systemPrompt).not.toContain("_script_output");
+    expect(systemPrompt).not.toContain("[object Object]");
   });
 });

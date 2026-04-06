@@ -335,15 +335,55 @@ describe("OrchestratorDecision", () => {
   it("OrchestratorDecision action field accepts only valid action values", async () => {
     const mod = await import("../../src/recipes/types.js");
     expect(mod).toBeDefined();
-    // Verify the ORCHESTRATOR_ACTIONS const array exports the four valid action strings
+    // Verify the ORCHESTRATOR_ACTIONS const array exports all valid action strings
     const actions = (mod as Record<string, unknown>)
       .ORCHESTRATOR_ACTIONS as readonly string[];
     expect(actions).toBeDefined();
-    expect(actions).toHaveLength(4);
+    expect(actions).toHaveLength(5);
     expect(actions).toContain("run_stage_agent");
     expect(actions).toContain("pause_for_input");
     expect(actions).toContain("finish_run");
     expect(actions).toContain("fail_run");
+    expect(actions).toContain("run_script");
+  });
+});
+
+// -------------------------------------------------------------------
+// Group 4b: OrchestratorDecision run_script extension (src/recipes/types.ts)
+// -------------------------------------------------------------------
+describe("OrchestratorDecision run_script extension", () => {
+  it("ORCHESTRATOR_ACTIONS includes run_script and has length 5", async () => {
+    const mod = await import("../../src/recipes/types.js");
+    const actions = (mod as Record<string, unknown>)
+      .ORCHESTRATOR_ACTIONS as readonly string[];
+    expect(actions).toBeDefined();
+    expect(actions).toHaveLength(5);
+    expect(actions).toContain("run_script");
+  });
+
+  it("OrchestratorDecision with script_id is constructible", async () => {
+    const mod = await import("../../src/recipes/types.js");
+    expect(mod).toBeDefined();
+    const decision: Record<string, unknown> = {
+      action: "run_script",
+      script_id: "knowledge.prime",
+      reason: "Execute the knowledge priming script.",
+    };
+    expect(decision.action).toBe("run_script");
+    expect(decision.script_id).toBe("knowledge.prime");
+    expect(decision.reason).toBe("Execute the knowledge priming script.");
+  });
+
+  it("OrchestratorDecision without script_id remains valid", async () => {
+    const mod = await import("../../src/recipes/types.js");
+    expect(mod).toBeDefined();
+    const decision: Record<string, unknown> = {
+      action: "run_stage_agent",
+      target_stage: "planning",
+      reason: "Proceed with planning stage.",
+    };
+    expect(decision.action).toBe("run_stage_agent");
+    expect(decision.script_id).toBeUndefined();
   });
 });
 

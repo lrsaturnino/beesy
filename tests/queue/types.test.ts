@@ -11,14 +11,28 @@ const PROJECT_ROOT = path.resolve(__dirname, "../..");
 // Group 1: SubtaskKind (src/queue/types.ts)
 // -------------------------------------------------------------------
 describe("SubtaskKind", () => {
-  it("exports SUBTASK_KINDS const array with three values", async () => {
+  it("exports SUBTASK_KINDS const array with four values", async () => {
     const mod = await import("../../src/queue/types.js");
     expect(mod.SUBTASK_KINDS).toBeDefined();
     const kinds = mod.SUBTASK_KINDS as readonly string[];
-    expect(kinds).toHaveLength(3);
+    expect(kinds).toHaveLength(4);
     expect(kinds).toContain("orchestrator_eval");
     expect(kinds).toContain("stage_agent_run");
     expect(kinds).toContain("resume_after_input");
+    expect(kinds).toContain("script_run");
+  });
+});
+
+// -------------------------------------------------------------------
+// Group 1b: SubtaskKind script_run extension (src/queue/types.ts)
+// -------------------------------------------------------------------
+describe("SubtaskKind script_run extension", () => {
+  it("SUBTASK_KINDS includes script_run and has length 4", async () => {
+    const mod = await import("../../src/queue/types.js");
+    expect(mod.SUBTASK_KINDS).toBeDefined();
+    const kinds = mod.SUBTASK_KINDS as readonly string[];
+    expect(kinds).toHaveLength(4);
+    expect(kinds).toContain("script_run");
   });
 });
 

@@ -27,6 +27,7 @@ export const ORCHESTRATOR_ACTIONS = [
   "pause_for_input",
   "finish_run",
   "fail_run",
+  "run_script",
 ] as const;
 
 /** Orchestrator decision action union type derived from {@link ORCHESTRATOR_ACTIONS}. */
@@ -124,6 +125,8 @@ export interface OrchestratorDecision {
   state_patch?: Record<string, unknown>;
   /** Human-readable justification for the decision. */
   reason?: string;
+  /** Identifier of the script to execute when action is run_script. */
+  script_id?: string;
 }
 
 // ---------------------------------------------------------------------------

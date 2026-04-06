@@ -27,6 +27,18 @@ vi.mock("../../src/runtime/stage-agent-handler.js", () => ({
   handleStageAgentRun: mockHandleStageAgentRun,
 }));
 
+// ---------------------------------------------------------------
+// Mock the script-handler for script_run dispatch isolation
+// ---------------------------------------------------------------
+
+const { mockHandleScriptRun } = vi.hoisted(() => ({
+  mockHandleScriptRun: vi.fn(),
+}));
+
+vi.mock("../../src/runtime/script-handler.js", () => ({
+  handleScriptRun: mockHandleScriptRun,
+}));
+
 // Import module under test
 import { runTask } from "../../src/runtime/worker.js";
 
@@ -45,6 +57,7 @@ import type {
   StepOutput,
   AgentBackend,
 } from "../../src/runners/types.js";
+import type { ScriptManifest } from "../../src/scripts/types.js";
 
 // ---------------------------------------------------------------
 // Shared helpers and fixtures
@@ -189,6 +202,27 @@ async function writeOrchestratorRole(recipe: RecipeConfig): Promise<void> {
   const rolePath = recipe.orchestrator.role;
   await mkdir(path.dirname(rolePath), { recursive: true });
   await writeFile(rolePath, "You are a test orchestrator.", "utf-8");
+}
+
+/** Factory for a minimal script registry with one test script. */
+function createTestRegistry(
+  overrides?: Partial<ScriptManifest>,
+): Map<string, ScriptManifest> {
+  const manifest: ScriptManifest = {
+    script_id: "test.script",
+    description: "A test script for unit testing",
+    runtime: "node",
+    path: "scripts/test.js",
+    timeout_ms: 30000,
+    retryable: false,
+    side_effects: "read-only",
+    required_env: [],
+    rerun_policy: "restart",
+    ...overrides,
+  };
+  const registry = new Map<string, ScriptManifest>();
+  registry.set(manifest.script_id, manifest);
+  return registry;
 }
 
 // ---------------------------------------------------------------
@@ -710,6 +744,74 @@ describe("Prompt Rendering Format", () => {
     expect(roleIdx).toBeLessThan(taskIdx);
     expect(taskIdx).toBeLessThan(outputIdx);
   });
+
+  it("Rendered prompt contains Available Scripts section in Task", async () => {
+    const recipe = createTestRecipe();
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+
+    const backend = createMockBackend([
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+
+    await runTask(task, recipe, runsDir);
+
+    const [passedConfig] = (backend.run as ReturnType<typeof vi.fn>).mock.calls[0];
+    const prompt = passedConfig.systemPrompt;
+
+    expect(prompt).toContain("Available Scripts");
+  });
+
+  it("Rendered prompt contains Allowed Scripts for This Stage section", async () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_transitions: ["implement"],
+          allowed_scripts: ["knowledge.prime"],
+        }),
+        implement: createStageDefinition({
+          role: path.join(runsDir, "roles", "implementer.md"),
+          objective: "Implement the plan",
+          outputs: [createStageOutput({ label: "code", format: "ts" })],
+          allowed_transitions: [],
+        }),
+      },
+    });
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+
+    const backend = createMockBackend([
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+
+    await runTask(task, recipe, runsDir);
+
+    const [passedConfig] = (backend.run as ReturnType<typeof vi.fn>).mock.calls[0];
+    const prompt = passedConfig.systemPrompt;
+
+    expect(prompt).toContain("Allowed Scripts for This Stage");
+  });
+
+  it("Output section includes run_script in action enum and script_id field", async () => {
+    const recipe = createTestRecipe();
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+
+    const backend = createMockBackend([
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+
+    await runTask(task, recipe, runsDir);
+
+    const [passedConfig] = (backend.run as ReturnType<typeof vi.fn>).mock.calls[0];
+    const prompt = passedConfig.systemPrompt;
+
+    expect(prompt).toContain("run_script");
+    expect(prompt).toContain("script_id");
+  });
 });
 
 // ---------------------------------------------------------------
@@ -749,5 +851,562 @@ describe("Serial Execution Invariant", () => {
       }
     }
     expect(openStarts).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------
+// Group 9: script_run Dispatch
+// ---------------------------------------------------------------
+
+describe("script_run Dispatch", () => {
+  it("Worker dispatch switch includes script_run case", async () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_transitions: ["implement"],
+          allowed_scripts: ["test.script"],
+        }),
+        implement: createStageDefinition({
+          role: path.join(runsDir, "roles", "implementer.md"),
+          objective: "Implement the plan",
+          outputs: [createStageOutput({ label: "code", format: "ts" })],
+          allowed_transitions: [],
+        }),
+      },
+    });
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+    const registry = createTestRegistry();
+
+    const backend = createMockBackend([
+      makeDecisionOutput({
+        action: "run_script",
+        script_id: "test.script",
+        input_patch: { key: "value" },
+        reason: "need data",
+      }),
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+    mockHandleScriptRun.mockResolvedValue({
+      output: "script done",
+      artifactIds: [],
+    });
+
+    await runTask(task, recipe, runsDir, registry);
+
+    expect(mockHandleScriptRun).toHaveBeenCalledOnce();
+    const [callTask, callSubtask, callRegistry, callRunsDir] =
+      mockHandleScriptRun.mock.calls[0];
+    expect(callTask.id).toBe("task-001");
+    expect(callSubtask.kind).toBe("script_run");
+    expect(callRegistry).toBe(registry);
+    expect(callRunsDir).toBe(runsDir);
+  });
+
+  it("script_run delegates to handleScriptRun with correct arguments", async () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_transitions: ["implement"],
+          allowed_scripts: ["test.script"],
+        }),
+        implement: createStageDefinition({
+          role: path.join(runsDir, "roles", "implementer.md"),
+          objective: "Implement the plan",
+          outputs: [createStageOutput({ label: "code", format: "ts" })],
+          allowed_transitions: [],
+        }),
+      },
+    });
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+    const registry = createTestRegistry();
+
+    const backend = createMockBackend([
+      makeDecisionOutput({
+        action: "run_script",
+        script_id: "test.script",
+        input_patch: { key: "value" },
+        reason: "run the script",
+      }),
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+    mockHandleScriptRun.mockResolvedValue({
+      output: "script completed successfully",
+      artifactIds: [],
+    });
+
+    await runTask(task, recipe, runsDir, registry);
+
+    // Verify all 4 positional arguments match expected values
+    expect(mockHandleScriptRun).toHaveBeenCalledOnce();
+    const args = mockHandleScriptRun.mock.calls[0];
+    expect(args[0].id).toBe("task-001");
+    expect(args[1].kind).toBe("script_run");
+    expect(args[2]).toBeInstanceOf(Map);
+    expect(args[2].has("test.script")).toBe(true);
+    expect(typeof args[3]).toBe("string"); // runsDir
+  });
+
+  it("After script_run success, next orchestrator_eval is auto-enqueued", async () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_transitions: ["implement"],
+          allowed_scripts: ["test.script"],
+        }),
+        implement: createStageDefinition({
+          role: path.join(runsDir, "roles", "implementer.md"),
+          objective: "Implement the plan",
+          outputs: [createStageOutput({ label: "code", format: "ts" })],
+          allowed_transitions: [],
+        }),
+      },
+    });
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+    const registry = createTestRegistry();
+
+    const backend = createMockBackend([
+      makeDecisionOutput({
+        action: "run_script",
+        script_id: "test.script",
+        input_patch: {},
+        reason: "go",
+      }),
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+    mockHandleScriptRun.mockResolvedValue({
+      output: "done",
+      artifactIds: [],
+    });
+
+    await runTask(task, recipe, runsDir, registry);
+
+    // Two backend.run calls means two orchestrator_evals were processed
+    expect(backend.run).toHaveBeenCalledTimes(2);
+
+    const journal = readJournal(runsDir, task.id);
+    const queuedEntries = journal.filter(
+      (e) => e.type === "subtask_queued" && (e as Record<string, unknown>).kind === "orchestrator_eval",
+    );
+    // At least 2: the initial orchestrator_eval + the one after script_run
+    expect(queuedEntries.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("script_run failure marks subtask failed and re-invokes orchestrator", async () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_transitions: ["implement"],
+          allowed_scripts: ["test.script"],
+        }),
+        implement: createStageDefinition({
+          role: path.join(runsDir, "roles", "implementer.md"),
+          objective: "Implement the plan",
+          outputs: [createStageOutput({ label: "code", format: "ts" })],
+          allowed_transitions: [],
+        }),
+      },
+    });
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+    const registry = createTestRegistry();
+
+    const backend = createMockBackend([
+      makeDecisionOutput({
+        action: "run_script",
+        script_id: "test.script",
+        input_patch: {},
+        reason: "go",
+      }),
+      makeDecisionOutput({ action: "fail_run", reason: "script failed irrecoverably" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+    mockHandleScriptRun.mockResolvedValue({
+      output: "",
+      artifactIds: [],
+      error: "script failed",
+    });
+
+    await runTask(task, recipe, runsDir, registry);
+
+    const journal = readJournal(runsDir, task.id);
+    const failedSubtasks = journal.filter((e) => e.type === "subtask_failed");
+    expect(failedSubtasks.length).toBeGreaterThanOrEqual(1);
+    expect((failedSubtasks[0] as Record<string, unknown>).kind).toBe("script_run");
+
+    // After failure, orchestrator gets re-invoked
+    expect(backend.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("script_run handler exception marks subtask failed and re-invokes orchestrator", async () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_transitions: ["implement"],
+          allowed_scripts: ["test.script"],
+        }),
+        implement: createStageDefinition({
+          role: path.join(runsDir, "roles", "implementer.md"),
+          objective: "Implement the plan",
+          outputs: [createStageOutput({ label: "code", format: "ts" })],
+          allowed_transitions: [],
+        }),
+      },
+    });
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+    const registry = createTestRegistry();
+
+    const backend = createMockBackend([
+      makeDecisionOutput({
+        action: "run_script",
+        script_id: "test.script",
+        input_patch: {},
+        reason: "go",
+      }),
+      makeDecisionOutput({ action: "fail_run", reason: "crashed" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+    mockHandleScriptRun.mockRejectedValue(new Error("unexpected crash"));
+
+    await runTask(task, recipe, runsDir, registry);
+
+    const journal = readJournal(runsDir, task.id);
+    const failedSubtasks = journal.filter((e) => e.type === "subtask_failed");
+    expect(failedSubtasks.length).toBeGreaterThanOrEqual(1);
+
+    // After crash, orchestrator gets re-invoked to decide recovery
+    expect(backend.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("script_run applies statePatch to task payload when present", async () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_transitions: ["implement"],
+          allowed_scripts: ["test.script"],
+        }),
+        implement: createStageDefinition({
+          role: path.join(runsDir, "roles", "implementer.md"),
+          objective: "Implement the plan",
+          outputs: [createStageOutput({ label: "code", format: "ts" })],
+          allowed_transitions: [],
+        }),
+      },
+    });
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+    const registry = createTestRegistry();
+
+    const backend = createMockBackend([
+      makeDecisionOutput({
+        action: "run_script",
+        script_id: "test.script",
+        input_patch: {},
+        reason: "go",
+      }),
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+    mockHandleScriptRun.mockResolvedValue({
+      output: "done",
+      artifactIds: [],
+      statePatch: { computed_value: 42 },
+    });
+
+    await runTask(task, recipe, runsDir, registry);
+
+    expect((task.payload as Record<string, unknown>).computed_value).toBe(42);
+  });
+
+  it("script_run stores artifactIds on task when present", async () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_transitions: ["implement"],
+          allowed_scripts: ["test.script"],
+        }),
+        implement: createStageDefinition({
+          role: path.join(runsDir, "roles", "implementer.md"),
+          objective: "Implement the plan",
+          outputs: [createStageOutput({ label: "code", format: "ts" })],
+          allowed_transitions: [],
+        }),
+      },
+    });
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+    const registry = createTestRegistry();
+
+    const backend = createMockBackend([
+      makeDecisionOutput({
+        action: "run_script",
+        script_id: "test.script",
+        input_patch: {},
+        reason: "go",
+      }),
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+    mockHandleScriptRun.mockResolvedValue({
+      output: "done",
+      artifactIds: ["art-script-1", "art-script-2"],
+    });
+
+    await runTask(task, recipe, runsDir, registry);
+
+    expect(task.artifactIds).toBeDefined();
+    expect(task.artifactIds).toContain("art-script-1");
+    expect(task.artifactIds).toContain("art-script-2");
+  });
+});
+
+// ---------------------------------------------------------------
+// Group 10: run_script Decision Application
+// ---------------------------------------------------------------
+
+describe("run_script Decision Application", () => {
+  it("run_script decision enqueues script_run subtask with script_id in payload", async () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_transitions: ["implement"],
+          allowed_scripts: ["test.script"],
+        }),
+        implement: createStageDefinition({
+          role: path.join(runsDir, "roles", "implementer.md"),
+          objective: "Implement the plan",
+          outputs: [createStageOutput({ label: "code", format: "ts" })],
+          allowed_transitions: [],
+        }),
+      },
+    });
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+    const registry = createTestRegistry();
+
+    const backend = createMockBackend([
+      makeDecisionOutput({
+        action: "run_script",
+        script_id: "test.script",
+        input_patch: { key: "value" },
+        reason: "need data",
+      }),
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+    mockHandleScriptRun.mockResolvedValue({
+      output: "done",
+      artifactIds: [],
+    });
+
+    await runTask(task, recipe, runsDir, registry);
+
+    // Should have a script_run subtask
+    const scriptSubtasks = task.subtasks!.filter((s) => s.kind === "script_run");
+    expect(scriptSubtasks.length).toBeGreaterThanOrEqual(1);
+    expect(scriptSubtasks[0].payload).toBeDefined();
+    expect((scriptSubtasks[0].payload as Record<string, unknown>).script_id).toBe("test.script");
+
+    // Journal should record the subtask_queued with kind script_run
+    const journal = readJournal(runsDir, task.id);
+    const queuedScripts = journal.filter(
+      (e) => e.type === "subtask_queued" && (e as Record<string, unknown>).kind === "script_run",
+    );
+    expect(queuedScripts.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("run_script decision increments totalActionCount", async () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_transitions: ["implement"],
+          allowed_scripts: ["test.script"],
+        }),
+        implement: createStageDefinition({
+          role: path.join(runsDir, "roles", "implementer.md"),
+          objective: "Implement the plan",
+          outputs: [createStageOutput({ label: "code", format: "ts" })],
+          allowed_transitions: [],
+        }),
+      },
+    });
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask({ totalActionCount: 0 });
+    const registry = createTestRegistry();
+
+    const backend = createMockBackend([
+      makeDecisionOutput({
+        action: "run_script",
+        script_id: "test.script",
+        input_patch: {},
+        reason: "go",
+      }),
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+    mockHandleScriptRun.mockResolvedValue({
+      output: "done",
+      artifactIds: [],
+    });
+
+    await runTask(task, recipe, runsDir, registry);
+
+    // run_script counts as an action, totalActionCount should be at least 1
+    expect(task.totalActionCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it("run_script decision applies state_patch to task when present", async () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_transitions: ["implement"],
+          allowed_scripts: ["test.script"],
+        }),
+        implement: createStageDefinition({
+          role: path.join(runsDir, "roles", "implementer.md"),
+          objective: "Implement the plan",
+          outputs: [createStageOutput({ label: "code", format: "ts" })],
+          allowed_transitions: [],
+        }),
+      },
+    });
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+    const registry = createTestRegistry();
+
+    const backend = createMockBackend([
+      makeDecisionOutput({
+        action: "run_script",
+        script_id: "test.script",
+        input_patch: {},
+        state_patch: { flag: true },
+        reason: "go",
+      }),
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+    mockHandleScriptRun.mockResolvedValue({
+      output: "done",
+      artifactIds: [],
+    });
+
+    await runTask(task, recipe, runsDir, registry);
+
+    // Journal should record the decision with state_patch
+    const journal = readJournal(runsDir, task.id);
+    const decisions = journal.filter((e) => e.type === "orchestrator_decision");
+    expect(decisions.length).toBeGreaterThanOrEqual(1);
+    const firstDecision = decisions[0] as Record<string, unknown>;
+    expect(firstDecision.state_patch).toEqual({ flag: true });
+  });
+});
+
+// ---------------------------------------------------------------
+// Group 11: Registry Threading
+// ---------------------------------------------------------------
+
+describe("Registry Threading", () => {
+  it("Registry is passed to validateDecision in handleOrchestratorEval", async () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_transitions: ["implement"],
+          allowed_scripts: ["test.script"],
+        }),
+        implement: createStageDefinition({
+          role: path.join(runsDir, "roles", "implementer.md"),
+          objective: "Implement the plan",
+          outputs: [createStageOutput({ label: "code", format: "ts" })],
+          allowed_transitions: [],
+        }),
+      },
+    });
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+    const registry = createTestRegistry();
+
+    const backend = createMockBackend([
+      // First: invalid run_script with unknown script_id -- should be rejected by validator
+      makeDecisionOutput({
+        action: "run_script",
+        script_id: "nonexistent.script",
+        input_patch: {},
+        reason: "try unknown",
+      }),
+      // Second: valid finish -- recovery
+      makeDecisionOutput({ action: "finish_run", reason: "recovered" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+
+    await runTask(task, recipe, runsDir, registry);
+
+    // The decision with unknown script_id should have been rejected
+    const journal = readJournal(runsDir, task.id);
+    const rejections = journal.filter((e) => e.type === "decision_rejected");
+    expect(rejections.length).toBeGreaterThanOrEqual(1);
+
+    // Task should still complete (recovered via finish_run)
+    expect(task.status).toBe("completed");
+  });
+
+  it("Registry is passed to buildOrchestratorContext in handleOrchestratorEval", async () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_transitions: ["implement"],
+          allowed_scripts: ["test.script"],
+        }),
+        implement: createStageDefinition({
+          role: path.join(runsDir, "roles", "implementer.md"),
+          objective: "Implement the plan",
+          outputs: [createStageOutput({ label: "code", format: "ts" })],
+          allowed_transitions: [],
+        }),
+      },
+    });
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+    const registry = createTestRegistry({
+      description: "A test script for registry threading verification",
+    });
+
+    const backend = createMockBackend([
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+
+    await runTask(task, recipe, runsDir, registry);
+
+    // Capture the prompt passed to the backend
+    const [passedConfig] = (backend.run as ReturnType<typeof vi.fn>).mock.calls[0];
+    const prompt = passedConfig.systemPrompt;
+
+    // When registry is threaded through, buildOrchestratorContext populates script catalog
+    expect(prompt).toContain("A test script for registry threading verification");
+  });
+
+  it("runTask works without registry (backward compatibility)", async () => {
+    const recipe = createTestRecipe();
+    await writeOrchestratorRole(recipe);
+    const task = createTestTask();
+
+    const backend = createMockBackend([
+      makeDecisionOutput({ action: "finish_run", reason: "done" }),
+    ]);
+    mockResolveAgentBackend.mockReturnValue(backend);
+
+    // Call runTask with 3 args (no registry) -- must still work
+    await runTask(task, recipe, runsDir);
+
+    expect(task.status).toBe("completed");
+    const journal = readJournal(runsDir, task.id);
+    const errors = journal.filter((e) => e.type === "task_failed");
+    expect(errors.length).toBe(0);
   });
 });

@@ -31,4 +31,6 @@ stages:
         mirror_to:
           - ".bees/planning.md"
     allowed_transitions: []
-    allowed_scripts: []
+    allowed_scripts:
+      - knowledge.prime
+      - implementation.batch_bridge

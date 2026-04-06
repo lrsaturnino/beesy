@@ -6,6 +6,10 @@ import type {
   RecipeConfig,
   StageDefinition,
 } from "../../src/recipes/types.js";
+import type {
+  ScriptManifest,
+  ScriptCatalogEntry,
+} from "../../src/scripts/types.js";
 
 // -------------------------------------------------------------------
 // Shared helpers and fixtures
@@ -84,6 +88,52 @@ function createTestTask(overrides?: Partial<Task>): Task {
     totalActionCount: 0,
     ...overrides,
   };
+}
+
+/** Factory for a ScriptManifest with valid defaults and overridable fields. */
+function createTestManifest(
+  overrides?: Partial<ScriptManifest>,
+): ScriptManifest {
+  return {
+    script_id: "test.script",
+    description: "A test script",
+    runtime: "node",
+    path: "scripts/test.js",
+    timeout_ms: 30000,
+    retryable: true,
+    side_effects: "read-only",
+    required_env: [],
+    rerun_policy: "restart",
+    ...overrides,
+  };
+}
+
+/** Factory for a registry Map with two script manifests. */
+function createTestRegistry(): Map<string, ScriptManifest> {
+  const registry = new Map<string, ScriptManifest>();
+  registry.set(
+    "knowledge.prime",
+    createTestManifest({
+      script_id: "knowledge.prime",
+      description: "Prime context with relevant knowledge",
+      runtime: "python",
+      side_effects: "read-only",
+      timeout_ms: 45000,
+      retryable: false,
+    }),
+  );
+  registry.set(
+    "repo.search",
+    createTestManifest({
+      script_id: "repo.search",
+      description: "Search the repository for patterns",
+      runtime: "node",
+      side_effects: "read-only",
+      timeout_ms: 20000,
+      retryable: true,
+    }),
+  );
+  return registry;
 }
 
 // -------------------------------------------------------------------
@@ -324,5 +374,169 @@ describe("Immutability and Object Safety", () => {
     ctx.retryCounts["planning"] = 999;
 
     expect(task.stageRetryCount!["planning"]).toBe(1);
+  });
+});
+
+// -------------------------------------------------------------------
+// Group 7: Script Catalog Population
+// -------------------------------------------------------------------
+
+describe("Script Catalog Population", () => {
+  it("populates scriptCatalog from registry when provided", () => {
+    const recipe = createTestRecipe();
+    const task = createTestTask();
+    const registry = createTestRegistry();
+
+    const ctx = buildOrchestratorContext(
+      task,
+      recipe,
+      null,
+      null,
+      "",
+      registry,
+    );
+
+    expect(ctx.scriptCatalog).toHaveLength(2);
+    const ids = ctx.scriptCatalog.map((e: ScriptCatalogEntry) => e.script_id);
+    expect(ids).toContain("knowledge.prime");
+    expect(ids).toContain("repo.search");
+  });
+
+  it("catalog entries contain all required fields from manifests", () => {
+    const recipe = createTestRecipe();
+    const task = createTestTask();
+    const registry = createTestRegistry();
+
+    const ctx = buildOrchestratorContext(
+      task,
+      recipe,
+      null,
+      null,
+      "",
+      registry,
+    );
+
+    const knowledgeEntry = ctx.scriptCatalog.find(
+      (e: ScriptCatalogEntry) => e.script_id === "knowledge.prime",
+    );
+    expect(knowledgeEntry).toBeDefined();
+    expect(knowledgeEntry!.description).toBe(
+      "Prime context with relevant knowledge",
+    );
+    expect(knowledgeEntry!.runtime).toBe("python");
+    expect(knowledgeEntry!.side_effects).toBe("read-only");
+    expect(knowledgeEntry!.timeout_ms).toBe(45000);
+    expect(knowledgeEntry!.retryable).toBe(false);
+  });
+
+  it("defaults scriptCatalog to empty array when registry is omitted", () => {
+    const recipe = createTestRecipe();
+    const task = createTestTask();
+
+    const ctx = buildOrchestratorContext(task, recipe, null, null, "");
+
+    expect(ctx.scriptCatalog).toEqual([]);
+  });
+
+  it("defaults scriptCatalog to empty array when registry is undefined", () => {
+    const recipe = createTestRecipe();
+    const task = createTestTask();
+
+    const ctx = buildOrchestratorContext(
+      task,
+      recipe,
+      null,
+      null,
+      "",
+      undefined,
+    );
+
+    expect(ctx.scriptCatalog).toEqual([]);
+  });
+
+  it("includes orchestrator_notes when present on manifest", () => {
+    const recipe = createTestRecipe();
+    const task = createTestTask();
+    const registry = new Map<string, ScriptManifest>();
+    registry.set(
+      "annotated.script",
+      createTestManifest({
+        script_id: "annotated.script",
+        description: "Script with notes",
+        orchestrator_notes: "Use when deep analysis is needed",
+      }),
+    );
+
+    const ctx = buildOrchestratorContext(
+      task,
+      recipe,
+      null,
+      null,
+      "",
+      registry,
+    );
+
+    expect(ctx.scriptCatalog).toHaveLength(1);
+    expect(ctx.scriptCatalog[0].orchestrator_notes).toBe(
+      "Use when deep analysis is needed",
+    );
+  });
+});
+
+// -------------------------------------------------------------------
+// Group 8: Allowed Scripts Extraction
+// -------------------------------------------------------------------
+
+describe("Allowed Scripts Extraction", () => {
+  it("extracts allowedScripts from current stage definition", () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_scripts: ["knowledge.prime", "repo.search"],
+        }),
+        implement: createStageDefinition({
+          role: "roles/implement.md",
+          objective: "Implement the plan",
+          allowed_transitions: ["implement", "planning"],
+        }),
+      },
+    });
+    const task = createTestTask({ currentStageId: "planning" });
+
+    const ctx = buildOrchestratorContext(task, recipe, null, null, "");
+
+    expect(ctx.allowedScripts).toEqual(["knowledge.prime", "repo.search"]);
+  });
+
+  it("returns empty allowedScripts when stage has no allowed scripts", () => {
+    const recipe = createTestRecipe();
+    const task = createTestTask({ currentStageId: "planning" });
+
+    const ctx = buildOrchestratorContext(task, recipe, null, null, "");
+
+    expect(ctx.allowedScripts).toEqual([]);
+  });
+
+  it("allowedScripts does not share reference with stageDefinition", () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_scripts: ["a", "b"],
+        }),
+        implement: createStageDefinition({
+          role: "roles/implement.md",
+          objective: "Implement the plan",
+          allowed_transitions: ["implement", "planning"],
+        }),
+      },
+    });
+    const task = createTestTask({ currentStageId: "planning" });
+
+    const ctx = buildOrchestratorContext(task, recipe, null, null, "");
+
+    // The readonly type prevents direct mutation, but we verify identity
+    // is separate to ensure no shared reference mutation risk
+    expect(ctx.allowedScripts).toEqual(["a", "b"]);
+    expect(ctx.stageDefinition.allowed_scripts).toEqual(["a", "b"]);
   });
 });

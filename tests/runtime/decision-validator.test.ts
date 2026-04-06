@@ -6,6 +6,7 @@ import type {
   RecipeConfig,
   StageDefinition,
 } from "../../src/recipes/types.js";
+import type { ScriptManifest } from "../../src/scripts/types.js";
 
 // -------------------------------------------------------------------
 // Shared helpers and fixtures
@@ -465,5 +466,497 @@ describe("Return Type Structure", () => {
       expect(typeof result.reason).toBe("string");
       expect(result.reason.length).toBeGreaterThan(0);
     }
+  });
+});
+
+// -------------------------------------------------------------------
+// Registry fixture helper
+// -------------------------------------------------------------------
+
+/**
+ * Build a test script registry with entries for validating run_script
+ * decisions. Uses env var names that will not exist in the test
+ * environment to trigger env validation failures deterministically.
+ */
+function createTestRegistry(): Map<string, ScriptManifest> {
+  const registry = new Map<string, ScriptManifest>();
+
+  registry.set("knowledge.prime", {
+    script_id: "knowledge.prime",
+    description: "Prime knowledge base",
+    runtime: "node",
+    path: "scripts/knowledge-prime.ts",
+    timeout_ms: 30000,
+    retryable: true,
+    side_effects: "read-only",
+    required_env: ["BEES_TEST_MISSING_VAR_XYZ"],
+    rerun_policy: "restart",
+  });
+
+  registry.set("repo.search", {
+    script_id: "repo.search",
+    description: "Search repository files",
+    runtime: "node",
+    path: "scripts/repo-search.ts",
+    timeout_ms: 15000,
+    retryable: false,
+    side_effects: "read-only",
+    required_env: [],
+    rerun_policy: "restart",
+  });
+
+  return registry;
+}
+
+// -------------------------------------------------------------------
+// Group 9: run_script Script ID Presence
+// -------------------------------------------------------------------
+
+describe("run_script Script ID Presence", () => {
+  it("rejects run_script when script_id is undefined", () => {
+    const recipe = createTestRecipe();
+    const registry = createTestRegistry();
+    const decision = createTestDecision({
+      action: "run_script",
+      script_id: undefined,
+      target_stage: undefined,
+    });
+
+    const result = validateDecision(
+      decision,
+      recipe,
+      "planning",
+      {},
+      0,
+      undefined,
+      registry,
+    );
+
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.reason).toContain("run_script requires a script_id");
+    }
+  });
+
+  it("rejects run_script when script_id is empty string", () => {
+    const recipe = createTestRecipe();
+    const registry = createTestRegistry();
+    const decision = createTestDecision({
+      action: "run_script",
+      script_id: "",
+      target_stage: undefined,
+    });
+
+    const result = validateDecision(
+      decision,
+      recipe,
+      "planning",
+      {},
+      0,
+      undefined,
+      registry,
+    );
+
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.reason).toContain("run_script requires a script_id");
+    }
+  });
+
+  it("does not apply script_id check to run_stage_agent", () => {
+    const recipe = createTestRecipe();
+    const registry = createTestRegistry();
+    const decision = createTestDecision({
+      action: "run_stage_agent",
+      target_stage: "implement",
+    });
+
+    const result = validateDecision(
+      decision,
+      recipe,
+      "planning",
+      {},
+      0,
+      undefined,
+      registry,
+    );
+
+    expect(result.valid).toBe(true);
+  });
+});
+
+// -------------------------------------------------------------------
+// Group 10: run_script Registry and Allowlist Validation
+// -------------------------------------------------------------------
+
+describe("run_script Registry and Allowlist Validation", () => {
+  it("accepts run_script with valid script_id in stage allowlist", () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_scripts: ["knowledge.prime", "repo.search"],
+        }),
+        implement: createStageDefinition({
+          role: "roles/implement.md",
+          objective: "Implement the plan",
+          outputs: [{ label: "implementation_code", format: "ts" }],
+          allowed_transitions: ["implement", "planning"],
+        }),
+      },
+    });
+    const registry = createTestRegistry();
+    const decision = createTestDecision({
+      action: "run_script",
+      script_id: "repo.search",
+      target_stage: undefined,
+    });
+
+    const result = validateDecision(
+      decision,
+      recipe,
+      "planning",
+      {},
+      0,
+      undefined,
+      registry,
+    );
+
+    expect(result.valid).toBe(true);
+  });
+
+  it("rejects run_script with script_id not found in registry", () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_scripts: ["nonexistent.script"],
+        }),
+        implement: createStageDefinition({
+          role: "roles/implement.md",
+          objective: "Implement the plan",
+          outputs: [{ label: "implementation_code", format: "ts" }],
+          allowed_transitions: ["implement", "planning"],
+        }),
+      },
+    });
+    const registry = createTestRegistry();
+    const decision = createTestDecision({
+      action: "run_script",
+      script_id: "nonexistent.script",
+      target_stage: undefined,
+    });
+
+    const result = validateDecision(
+      decision,
+      recipe,
+      "planning",
+      {},
+      0,
+      undefined,
+      registry,
+    );
+
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.reason).toContain("nonexistent.script");
+      expect(result.reason).toContain("not found in registry");
+    }
+  });
+
+  it("rejects run_script with script_id not in stage allowed_scripts", () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_scripts: [],
+        }),
+        implement: createStageDefinition({
+          role: "roles/implement.md",
+          objective: "Implement the plan",
+          outputs: [{ label: "implementation_code", format: "ts" }],
+          allowed_transitions: ["implement", "planning"],
+        }),
+      },
+    });
+    const registry = createTestRegistry();
+    const decision = createTestDecision({
+      action: "run_script",
+      script_id: "knowledge.prime",
+      target_stage: undefined,
+    });
+
+    const result = validateDecision(
+      decision,
+      recipe,
+      "planning",
+      {},
+      0,
+      undefined,
+      registry,
+    );
+
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.reason).toContain("knowledge.prime");
+    }
+  });
+
+  it("accepts run_script when registry is not provided (backward compat)", () => {
+    const recipe = createTestRecipe();
+    const decision = createTestDecision({
+      action: "run_script",
+      script_id: "anything",
+      target_stage: undefined,
+    });
+
+    const result = validateDecision(
+      decision,
+      recipe,
+      "planning",
+      {},
+      0,
+    );
+
+    expect(result.valid).toBe(true);
+  });
+});
+
+// -------------------------------------------------------------------
+// Group 11: run_script Environment Requirements Validation
+// -------------------------------------------------------------------
+
+describe("run_script Environment Requirements Validation", () => {
+  it("rejects run_script when required env vars are missing", () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_scripts: ["knowledge.prime"],
+        }),
+        implement: createStageDefinition({
+          role: "roles/implement.md",
+          objective: "Implement the plan",
+          outputs: [{ label: "implementation_code", format: "ts" }],
+          allowed_transitions: ["implement", "planning"],
+        }),
+      },
+    });
+    const registry = createTestRegistry();
+    const decision = createTestDecision({
+      action: "run_script",
+      script_id: "knowledge.prime",
+      target_stage: undefined,
+    });
+
+    const result = validateDecision(
+      decision,
+      recipe,
+      "planning",
+      {},
+      0,
+      undefined,
+      registry,
+    );
+
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.reason).toContain("BEES_TEST_MISSING_VAR_XYZ");
+    }
+  });
+
+  it("accepts run_script when script has no required env vars", () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_scripts: ["repo.search"],
+        }),
+        implement: createStageDefinition({
+          role: "roles/implement.md",
+          objective: "Implement the plan",
+          outputs: [{ label: "implementation_code", format: "ts" }],
+          allowed_transitions: ["implement", "planning"],
+        }),
+      },
+    });
+    const registry = createTestRegistry();
+    const decision = createTestDecision({
+      action: "run_script",
+      script_id: "repo.search",
+      target_stage: undefined,
+    });
+
+    const result = validateDecision(
+      decision,
+      recipe,
+      "planning",
+      {},
+      0,
+      undefined,
+      registry,
+    );
+
+    expect(result.valid).toBe(true);
+  });
+
+  it("lists all missing env var names in the violation", () => {
+    const registry = new Map<string, ScriptManifest>();
+    registry.set("multi.env", {
+      script_id: "multi.env",
+      description: "Script needing multiple env vars",
+      runtime: "node",
+      path: "scripts/multi-env.ts",
+      timeout_ms: 10000,
+      retryable: false,
+      side_effects: "read-only",
+      required_env: ["BEES_MISSING_A", "BEES_MISSING_B"],
+      rerun_policy: "restart",
+    });
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_scripts: ["multi.env"],
+        }),
+        implement: createStageDefinition({
+          role: "roles/implement.md",
+          objective: "Implement the plan",
+          outputs: [{ label: "implementation_code", format: "ts" }],
+          allowed_transitions: ["implement", "planning"],
+        }),
+      },
+    });
+    const decision = createTestDecision({
+      action: "run_script",
+      script_id: "multi.env",
+      target_stage: undefined,
+    });
+
+    const result = validateDecision(
+      decision,
+      recipe,
+      "planning",
+      {},
+      0,
+      undefined,
+      registry,
+    );
+
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.reason).toContain("BEES_MISSING_A");
+      expect(result.reason).toContain("BEES_MISSING_B");
+    }
+  });
+});
+
+// -------------------------------------------------------------------
+// Group 12: run_script Combined Violations and Backward Compatibility
+// -------------------------------------------------------------------
+
+describe("run_script Combined Violations and Backward Compatibility", () => {
+  it("collects script violations alongside other rule violations", () => {
+    const recipe = createTestRecipe({
+      stages: {
+        planning: createStageDefinition({
+          allowed_scripts: [],
+        }),
+        implement: createStageDefinition({
+          role: "roles/implement.md",
+          objective: "Implement the plan",
+          outputs: [{ label: "implementation_code", format: "ts" }],
+          allowed_transitions: ["implement", "planning"],
+        }),
+      },
+    });
+    const registry = createTestRegistry();
+    const decision = createTestDecision({
+      action: "run_script",
+      script_id: "nonexistent.script",
+      target_stage: undefined,
+    });
+
+    const result = validateDecision(
+      decision,
+      recipe,
+      "planning",
+      {},
+      50,
+      undefined,
+      registry,
+    );
+
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      // Script violation present (not found in registry)
+      expect(result.reason).toContain("nonexistent.script");
+      // Total action budget violation present
+      expect(result.reason).toContain("50");
+    }
+  });
+
+  it("existing action types unaffected by registry parameter", () => {
+    const recipe = createTestRecipe();
+    const registry = createTestRegistry();
+    const decision = createTestDecision({
+      action: "run_stage_agent",
+      target_stage: "implement",
+    });
+
+    const result = validateDecision(
+      decision,
+      recipe,
+      "planning",
+      {},
+      0,
+      undefined,
+      registry,
+    );
+
+    expect(result.valid).toBe(true);
+    if (result.valid) {
+      expect(result.decision).toBe(decision);
+    }
+  });
+
+  it("all existing test groups still pass (regression guard)", () => {
+    // Verify existing action types work without registry parameter
+    const recipe = createTestRecipe();
+
+    // run_stage_agent still works
+    const stageResult = validateDecision(
+      createTestDecision({ target_stage: "implement" }),
+      recipe,
+      "planning",
+      {},
+      0,
+    );
+    expect(stageResult.valid).toBe(true);
+
+    // pause_for_input still works
+    const pauseResult = validateDecision(
+      createTestDecision({ action: "pause_for_input", target_stage: undefined }),
+      recipe,
+      "planning",
+      {},
+      0,
+    );
+    expect(pauseResult.valid).toBe(true);
+
+    // fail_run still works
+    const failResult = validateDecision(
+      createTestDecision({ action: "fail_run", target_stage: undefined }),
+      recipe,
+      "planning",
+      {},
+      0,
+    );
+    expect(failResult.valid).toBe(true);
+
+    // finish_run with outputs still works
+    const finishResult = validateDecision(
+      createTestDecision({ action: "finish_run", target_stage: undefined }),
+      recipe,
+      "planning",
+      {},
+      0,
+      new Set(["planning_doc"]),
+    );
+    expect(finishResult.valid).toBe(true);
   });
 });

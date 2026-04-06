@@ -3,10 +3,11 @@
  *
  * Assembles the full prompt context for orchestrator evaluation subtasks by
  * extracting the current stage, allowed transitions, budget limits, retry
- * counters, latest stage output, previous input patch, and journal summary
- * from the task state and recipe configuration. The resulting context object
- * is consumed by the worker loop to render the orchestrator prompt in the
- * `# Role / # Task / # Output` format.
+ * counters, latest stage output, previous input patch, journal summary,
+ * script catalog, and stage-level script allowlist from the task state,
+ * recipe configuration, and optional script registry. The resulting context
+ * object is consumed by the worker loop to render the orchestrator prompt
+ * in the `# Role / # Task / # Output` format.
  *
  * This is a pure, synchronous, data-assembly function with no side effects
  * or I/O. It follows the fresh-object-return pattern established by
@@ -17,6 +18,8 @@
 
 import type { Task } from "../queue/types.js";
 import type { RecipeConfig, StageDefinition } from "../recipes/types.js";
+import type { ScriptCatalogEntry, ScriptManifest } from "../scripts/types.js";
+import { buildCatalogSummary } from "../scripts/registry.js";
 
 // ---------------------------------------------------------------------------
 // Context type
@@ -50,6 +53,16 @@ export interface OrchestratorContext {
   maxTotalActions: number;
   /** Concise summary of recent run journal events. */
   journalSummary: string;
+  /**
+   * Orchestrator-visible catalog of all registered scripts.
+   * @see ScriptCatalogEntry for the projected fields available to the orchestrator.
+   */
+  scriptCatalog: ScriptCatalogEntry[];
+  /**
+   * Script IDs the orchestrator may invoke in the current stage.
+   * Sourced from {@link StageDefinition.allowed_scripts}.
+   */
+  allowedScripts: readonly string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +82,8 @@ export interface OrchestratorContext {
  * @param latestStageOutput - Output from the last completed stage run (null or undefined on first eval)
  * @param inputPatch        - Input modifications from the previous orchestrator decision (null or undefined when absent)
  * @param journalSummary    - Concise summary of recent run journal events
+ * @param registry          - Optional script registry for populating the script catalog.
+ *                            Obtained from {@link loadScriptRegistry} in scripts/registry.
  * @returns A fully populated OrchestratorContext for prompt rendering
  * @throws Error if the task has no currentStageId set (programming error in caller)
  * @throws Error if the task's currentStageId does not match any stage in the recipe
@@ -79,6 +94,7 @@ export function buildOrchestratorContext(
   latestStageOutput: string | null | undefined,
   inputPatch: Record<string, unknown> | null | undefined,
   journalSummary: string,
+  registry?: Map<string, ScriptManifest>,
 ): OrchestratorContext {
   const stageId = task.currentStageId;
   if (!stageId) {
@@ -105,5 +121,7 @@ export function buildOrchestratorContext(
     maxStageRetries: recipe.orchestrator.max_stage_retries,
     maxTotalActions: recipe.orchestrator.max_total_actions,
     journalSummary,
+    scriptCatalog: registry ? buildCatalogSummary(registry) : [],
+    allowedScripts: stageDefinition.allowed_scripts,
   };
 }

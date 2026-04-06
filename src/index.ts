@@ -2,9 +2,9 @@
  * Application entry point and composition root for the Bees platform.
  *
  * Wires all components into a running pipeline: Slack adapter, gate router,
- * BullMQ task queue, executor, dispatcher, and CLI agent backends. Handles
- * startup sequencing, message routing, worker processing, and graceful
- * shutdown on SIGTERM/SIGINT.
+ * recipe router, script registry, BullMQ task queue, executor, dispatcher,
+ * and CLI agent backends. Handles startup sequencing, message routing,
+ * worker processing, and graceful shutdown on SIGTERM/SIGINT.
  *
  * @module index
  */
@@ -28,6 +28,8 @@ import { initRecipeRouter, detectCollisions } from "./recipes/router.js";
 import type { RecipeRouter } from "./recipes/router.js";
 import type { RecipeConfig } from "./recipes/types.js";
 import { runTask } from "./runtime/worker.js";
+import { loadScriptRegistry } from "./scripts/registry.js";
+import type { ScriptManifest } from "./scripts/types.js";
 
 import type { Config } from "./utils/config.js";
 import type { GateConfig } from "./gates/types.js";
@@ -53,6 +55,10 @@ export interface StartAppOptions {
   runsDir?: string;
   /** Override configuration values loaded from environment. */
   config?: Partial<Config>;
+  /** Override path to the script manifest YAML file. */
+  manifestPath?: string;
+  /** Pre-built script registry, bypasses file loading when provided. */
+  scriptRegistry?: Map<string, ScriptManifest>;
 }
 
 /** Default gates directory relative to project root. */
@@ -63,6 +69,9 @@ const DEFAULT_RECIPES_DIR = new URL("../recipes", import.meta.url).pathname;
 
 /** Default runs directory for recipe task persistence. */
 const DEFAULT_RUNS_DIR = new URL("../runtime/runs", import.meta.url).pathname;
+
+/** Default script manifest path relative to project root. */
+const DEFAULT_MANIFEST_PATH = new URL("../scripts/manifest.yaml", import.meta.url).pathname;
 
 /** Extract a human-readable message from an unknown caught error value. */
 function extractErrorMessage(error: unknown): string {
@@ -205,10 +214,11 @@ async function handleWorkerError(
  * `stderrSink` closure that routes script stderr to the task's Slack thread,
  * then calls executeTask with progress reporting.
  *
- * @param adapter - Slack adapter for thread creation, progress, and result replies
- * @param runners - Shared runner dependencies (copied per-task with stderrSink)
- * @param log     - Logger instance for structured error reporting
- * @param runsDir - Base directory for recipe task run data persistence
+ * @param adapter  - Slack adapter for thread creation, progress, and result replies
+ * @param runners  - Shared runner dependencies (copied per-task with stderrSink)
+ * @param log      - Logger instance for structured error reporting
+ * @param runsDir  - Base directory for recipe task run data persistence
+ * @param registry - Script registry for resolving script_run subtasks in recipe-driven tasks
  * @returns Async processor function suitable for TaskQueue.startWorker
  */
 function createWorkerProcessor(
@@ -216,6 +226,7 @@ function createWorkerProcessor(
   runners: RunnerDeps,
   log: ReturnType<typeof createLogger>,
   runsDir: string,
+  registry?: Map<string, ScriptManifest>,
 ): (job: Job) => Promise<void> {
   return async (job: Job): Promise<void> => {
     const data = job.data as Record<string, unknown>;
@@ -242,7 +253,7 @@ function createWorkerProcessor(
       }
 
       try {
-        await runTask(task, recipeConfig, runsDir);
+        await runTask(task, recipeConfig, runsDir, registry);
         await sendTaskResultReply(adapter, task);
       } catch (err: unknown) {
         await handleWorkerError(adapter, log, task, job.id, err, {
@@ -401,19 +412,6 @@ function createMessageHandler(
 }
 
 /**
- * Boot the application: load config, initialize all components, wire the
- * pipeline, and connect to Slack.
- *
- * Serves as the composition root: creates all components, wires their
- * dependencies, and orchestrates the startup sequence. No business logic
- * lives here -- only component creation and wiring.
- *
- * Startup sequence: config -> router -> queue -> adapter -> worker -> message handler -> connect
- *
- * @param options - Optional overrides for gates directory and config values
- * @returns An AppHandle with a shutdown method for graceful teardown
- */
-/**
  * Boot the application when run directly (not imported as a module).
  * Calls startApp() and keeps the process alive via the Slack Socket Mode
  * connection and BullMQ worker event loop.
@@ -429,6 +427,22 @@ if (isMainModule) {
   });
 }
 
+/**
+ * Boot the application: load config, initialize all components, wire the
+ * pipeline, and connect to Slack.
+ *
+ * Serves as the composition root: creates all components, wires their
+ * dependencies, and orchestrates the startup sequence. No business logic
+ * lives here -- only component creation and wiring.
+ *
+ * Startup sequence:
+ *   config -> gate router -> recipe router -> script registry ->
+ *   task queue -> adapter -> worker -> message handler -> connect
+ *
+ * @param options - Optional overrides for directories, config, manifest path,
+ *   and pre-built script registry (see {@link StartAppOptions})
+ * @returns An AppHandle with a shutdown method for graceful teardown
+ */
 export async function startApp(options?: StartAppOptions): Promise<AppHandle> {
   const config = { ...loadConfig(), ...options?.config };
   const log = createLogger(config.logLevel);
@@ -456,6 +470,21 @@ export async function startApp(options?: StartAppOptions): Promise<AppHandle> {
   // Detect command collisions between recipes and gates at startup
   detectCollisions(recipeRouter, router, log);
 
+  // Load or inject the script registry for script_run dispatch
+  const manifestPath = options?.manifestPath ?? DEFAULT_MANIFEST_PATH;
+  let registry: Map<string, ScriptManifest>;
+  if (options?.scriptRegistry) {
+    registry = options.scriptRegistry;
+  } else {
+    const basePath = new URL("..", import.meta.url).pathname;
+    registry = await loadScriptRegistry(manifestPath, basePath);
+  }
+  log.info(`Script registry loaded with ${registry.size} script(s)`, {
+    scriptCount: registry.size,
+    source: options?.scriptRegistry ? "override" : "manifest",
+    manifestPath,
+  });
+
   // Create the task queue with Redis connection
   const queue = createTaskQueue({ redisUrl: config.redisUrl });
 
@@ -469,7 +498,7 @@ export async function startApp(options?: StartAppOptions): Promise<AppHandle> {
   const runners: RunnerDeps = { runScript, runTool };
 
   // Wire the worker processor and message handler (dual-router pipeline)
-  const processor = createWorkerProcessor(adapter, runners, log, runsDir);
+  const processor = createWorkerProcessor(adapter, runners, log, runsDir, registry);
   queue.startWorker(processor);
 
   const messageHandler = createMessageHandler(recipeRouter, router, adapter, queue, log);
