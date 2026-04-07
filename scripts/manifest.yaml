@@ -8,7 +8,7 @@ scripts:
     side_effects: read-only
     required_env:
       - ANTHROPIC_API_KEY
-    orchestrator_notes: "Run early in a workflow to establish codebase context for downstream agents"
+    orchestrator_notes: "Use in prime_knowledge stage when codebase context is needed for downstream analysis or planning. Provides architectural patterns, dependency graphs, and coding conventions. Do not use when context was already primed in the current task or when only a single-file lookup is needed -- use repo.search instead. Do not re-run if prior output is still valid. Input: task_state with repository path and optional focus areas. Output: comprehensive codebase context injected into state for later stages."
     rerun_policy: restart
 
   - script_id: implementation.batch_bridge
@@ -19,7 +19,7 @@ scripts:
     retryable: false
     side_effects: workspace-write
     required_env: []
-    orchestrator_notes: "Run after planning stage to generate task packs for external implementation pipeline"
+    orchestrator_notes: "Use after planning is finalized and a planning document exists in state. Generates task packs for the external implementation pipeline. Do not use before a planning document has been produced -- the script will fail without valid planning input. Do not re-run if tasks already exist from a prior run, as this will create duplicates. Skip when the recipe does not include an implementation handoff stage. Input: task_state containing planning artifacts. Output: task packs written to workspace."
     rerun_policy: refuse
 
   - script_id: monitoring.check_health
@@ -30,7 +30,7 @@ scripts:
     retryable: true
     side_effects: read-only
     required_env: []
-    orchestrator_notes: "Run in collect_data stage to gather health status"
+    orchestrator_notes: "Use in collect_data stage when system health data is needed as a precondition for analysis or decision-making. Provides operational status of target systems. Do not use in implementation recipes where system health is not relevant to the workflow. Avoid running without a clear downstream consumer for the health data. Input: task_state (no special fields required). Output: health_status in state_patch for downstream aggregation."
     rerun_policy: restart
 
   - script_id: monitoring.aggregate_metrics
@@ -41,7 +41,7 @@ scripts:
     retryable: true
     side_effects: read-only
     required_env: []
-    orchestrator_notes: "Run in collect_data stage after health check to compile metrics"
+    orchestrator_notes: "Use in collect_data stage after check_health has run to compile metrics from health data. Provides aggregated metric summaries for reporting stages. Do not use before health data has been collected -- results will be empty without prior collection. Skip in recipes that do not include a monitoring or reporting stage. Input: task_state with health data from prior collection. Output: aggregated metrics in state_patch."
     rerun_policy: restart
 
   - script_id: delivery.stage_explicit
@@ -52,7 +52,7 @@ scripts:
     retryable: false
     side_effects: workspace-write
     required_env: []
-    orchestrator_notes: "Run in commit_and_pr stage to stage files before committing"
+    orchestrator_notes: "Use as the first step in the commit_and_pr delivery sequence to stage files for committing. Always runs before commit_with_trailers. Do not use before staging decisions are finalized or without a list of files to stage. Avoid re-running after files are already staged unless the staging set has changed. Input: task_state with file paths to stage. Output: staging confirmation in state_patch."
     rerun_policy: restart
 
   - script_id: delivery.commit_with_trailers
@@ -63,7 +63,7 @@ scripts:
     retryable: false
     side_effects: workspace-write
     required_env: []
-    orchestrator_notes: "Run in commit_and_pr stage after staging to create the commit"
+    orchestrator_notes: "Use in commit_and_pr stage after stage_explicit has staged files. Creates a conventional commit with identity trailers. Do not use before files are staged -- the commit will be empty. Never re-run after a successful commit without reverting, as it will create duplicate commits. Input: task_state with commit message and trailer metadata. Output: commit SHA in state_patch."
     rerun_policy: refuse
 
   - script_id: delivery.push_branch
@@ -75,7 +75,7 @@ scripts:
     side_effects: external-write
     required_env:
       - GITHUB_TOKEN
-    orchestrator_notes: "Run in commit_and_pr stage after commit to push the branch"
+    orchestrator_notes: "Use in commit_and_pr stage after commit_with_trailers to push the local branch to remote. Requires GITHUB_TOKEN for authentication. Do not use before a commit exists -- there is nothing to push. Avoid running without verifying that the commit succeeded. Retryable on transient network failures. Input: task_state with branch name and remote target. Output: push confirmation in state_patch."
     rerun_policy: restart
 
   - script_id: delivery.upsert_draft_pr
@@ -87,5 +87,136 @@ scripts:
     side_effects: external-write
     required_env:
       - GITHUB_TOKEN
-    orchestrator_notes: "Run in commit_and_pr stage after push to create or update the PR"
+    orchestrator_notes: "Use as the final step in commit_and_pr stage after push_branch. Creates or updates a draft PR on GitHub. Requires GITHUB_TOKEN for authentication. Do not use before the branch has been pushed -- the PR target will not exist on remote. Skip if no PR is needed for this workflow. Input: task_state with PR title, body, and branch info. Output: PR URL in state_patch."
     rerun_policy: restart
+
+  - script_id: repo.search
+    description: "Search repository files and content using pattern matching"
+    runtime: shell
+    path: scripts/repo/search.sh
+    timeout_ms: 90000
+    retryable: true
+    side_effects: read-only
+    required_env: []
+    orchestrator_notes: "Use in historical_search or prime_codebase stages when specific code patterns, function references, or string occurrences need to be located across the repository. Provides file paths, line numbers, and matching content. Do not use for broad codebase understanding -- use knowledge.prime instead. Avoid searching for extremely common patterns that will produce excessive results. Input: input_patch with query (search pattern) and path (search directory). Output: matches array in state_patch with file, line, and content for each hit."
+    rerun_policy: restart
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: "Search pattern (passed to grep -r)"
+        path:
+          type: string
+          description: "Directory to search in (relative to workspace root)"
+          default: "."
+      required:
+        - query
+    output_schema:
+      type: object
+      properties:
+        summary:
+          type: string
+          description: "Human-readable search result summary"
+        state_patch:
+          type: object
+          properties:
+            matches:
+              type: array
+              items:
+                type: object
+                properties:
+                  file:
+                    type: string
+                  line:
+                    type: integer
+                  content:
+                    type: string
+        metrics:
+          type: object
+          properties:
+            match_count:
+              type: integer
+
+  - script_id: repo.git_history
+    description: "Analyze git log and blame history for repository files"
+    runtime: shell
+    path: scripts/repo/git_history.sh
+    timeout_ms: 60000
+    retryable: true
+    side_effects: read-only
+    required_env: []
+    orchestrator_notes: "Use in historical_search stage when commit history or authorship context is needed for a file or directory. Provides git log entries or blame annotations. Do not use in non-git repositories or when historical context is not relevant to the task. Avoid blame mode on large files as output can be verbose. Input: input_patch with path (file or directory) and mode ('log' or 'blame'). Output: entries array in state_patch with history lines."
+    rerun_policy: restart
+    input_schema:
+      type: object
+      properties:
+        path:
+          type: string
+          description: "File or directory path (relative to workspace root)"
+          default: "."
+        mode:
+          type: string
+          description: "Analysis mode: 'log' for commit history, 'blame' for line authorship"
+          default: "log"
+          enum:
+            - log
+            - blame
+    output_schema:
+      type: object
+      properties:
+        summary:
+          type: string
+          description: "Human-readable history analysis summary"
+        state_patch:
+          type: object
+          properties:
+            entries:
+              type: array
+              items:
+                type: string
+        metrics:
+          type: object
+          properties:
+            entry_count:
+              type: integer
+
+  - script_id: repo.file_map
+    description: "Map directory tree structure and file layout in the repository"
+    runtime: shell
+    path: scripts/repo/file_map.sh
+    timeout_ms: 60000
+    retryable: true
+    side_effects: read-only
+    required_env: []
+    orchestrator_notes: "Use in prime_codebase stage when directory structure and file layout needs to be understood before deeper analysis. Provides a flat list of file paths up to a specified depth. Do not use when only specific files are needed -- use repo.search instead. Avoid excessive depth values on large repositories as the file list can grow very large. Input: input_patch with path (root directory) and depth (max depth, default 3). Output: tree array in state_patch with file paths."
+    rerun_policy: restart
+    input_schema:
+      type: object
+      properties:
+        path:
+          type: string
+          description: "Root directory to map (relative to workspace root)"
+          default: "."
+        depth:
+          type: integer
+          description: "Maximum traversal depth"
+          default: 3
+    output_schema:
+      type: object
+      properties:
+        summary:
+          type: string
+          description: "Human-readable file map summary"
+        state_patch:
+          type: object
+          properties:
+            tree:
+              type: array
+              items:
+                type: string
+        metrics:
+          type: object
+          properties:
+            file_count:
+              type: integer

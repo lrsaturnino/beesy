@@ -253,7 +253,7 @@ describe("external pipeline asset packaging", () => {
 // -------------------------------------------------------------------
 
 describe("recipe integration for allowed_scripts", () => {
-  it("new-implementation recipe YAML includes both scripts in planning stage", async () => {
+  it("new-implementation recipe YAML includes scripts in their designated stages", async () => {
     const recipeYamlPath = path.join(
       PROJECT_ROOT,
       "recipes",
@@ -265,16 +265,23 @@ describe("recipe integration for allowed_scripts", () => {
 
     const stages = parsed.stages as Record<string, Record<string, unknown>>;
     expect(stages).toBeDefined();
-    expect(stages.planning).toBeDefined();
 
-    const allowedScripts = stages.planning.allowed_scripts as string[];
-    expect(allowedScripts).toBeDefined();
-    expect(Array.isArray(allowedScripts)).toBe(true);
-    expect(allowedScripts).toContain("knowledge.prime");
-    expect(allowedScripts).toContain("implementation.batch_bridge");
+    // knowledge.prime is assigned to the prime_knowledge stage
+    expect(stages.prime_knowledge).toBeDefined();
+    const primeKnowledgeScripts = stages.prime_knowledge.allowed_scripts as string[];
+    expect(primeKnowledgeScripts).toBeDefined();
+    expect(Array.isArray(primeKnowledgeScripts)).toBe(true);
+    expect(primeKnowledgeScripts).toContain("knowledge.prime");
+
+    // implementation.batch_bridge is assigned to the batch_implement stage
+    expect(stages.batch_implement).toBeDefined();
+    const batchImplementScripts = stages.batch_implement.allowed_scripts as string[];
+    expect(batchImplementScripts).toBeDefined();
+    expect(Array.isArray(batchImplementScripts)).toBe(true);
+    expect(batchImplementScripts).toContain("implementation.batch_bridge");
   });
 
-  it("decision validator accepts run_script for knowledge.prime in planning stage", async () => {
+  it("decision validator accepts run_script for knowledge.prime in prime_knowledge stage", async () => {
     const manifestPath = path.join(PROJECT_ROOT, "scripts", "manifest.yaml");
     const registry = await loadScriptRegistry(manifestPath, PROJECT_ROOT);
 
@@ -301,18 +308,18 @@ describe("recipe integration for allowed_scripts", () => {
           max_total_actions: 40,
         },
         stages: {
-          planning: {
-            role: "roles/implementation/planning-create.md",
-            objective: "Analyze the request and produce an implementation plan",
+          prime_knowledge: {
+            role: "roles/implementation/knowledge-synthesis.md",
+            objective: "Synthesize knowledge context from codebase and planning artifacts",
             inputs: [
               {
-                description: "User request",
-                source: "task.payload.description",
+                description: "Adjusted planning document",
+                source: "artifacts.adjusted_planning_doc",
               },
             ],
-            outputs: [{ label: "planning_doc", format: "md" }],
-            allowed_transitions: [],
-            allowed_scripts: ["knowledge.prime", "implementation.batch_bridge"],
+            outputs: [{ label: "knowledge_context", format: "md" }],
+            allowed_transitions: ["prime_guidelines"],
+            allowed_scripts: ["knowledge.prime"],
           } as StageDefinition,
         },
       };
@@ -320,13 +327,13 @@ describe("recipe integration for allowed_scripts", () => {
       const decision = {
         action: "run_script" as const,
         script_id: "knowledge.prime",
-        reasoning: "Prime knowledge context for planning",
+        reasoning: "Prime knowledge context for downstream analysis",
       };
 
       const result = validateDecision(
         decision,
         recipe,
-        "planning",
+        "prime_knowledge",
         {},
         0,
         new Set<string>(),
