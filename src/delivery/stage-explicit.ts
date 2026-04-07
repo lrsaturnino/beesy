@@ -3,7 +3,7 @@
  *
  * Stages specific files via individual git add commands while enforcing
  * a hardcoded exclusion list to protect sensitive directories and files.
- * Supports glob pattern expansion via Node.js 22 built-in fs.globSync.
+ * Supports glob pattern expansion via git ls-files.
  *
  * Never performs broad git add (no -A or .). Each file is staged
  * individually after passing exclusion checks.
@@ -11,7 +11,7 @@
  * @module delivery/stage-explicit
  */
 
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { createLogger } from "../utils/logger.js";
@@ -173,10 +173,11 @@ function expandPatterns(
   for (const pattern of patterns) {
     if (GLOB_METACHARACTERS.test(pattern)) {
       try {
-        const matches = execSync(`git ls-files --others --cached -- '${pattern}'`, {
-          cwd: workspacePath,
-          encoding: "utf-8",
-        }).trim();
+        const matches = execFileSync(
+          "git",
+          ["ls-files", "--others", "--cached", "--", pattern],
+          { cwd: workspacePath, encoding: "utf-8", timeout: GIT_COMMAND_TIMEOUT_MS, stdio: "pipe" },
+        ).trim();
         if (matches) {
           for (const match of matches.split("\n")) {
             addUnique(match);
