@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import { mkdtemp, writeFile, rm, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -751,17 +751,27 @@ describe("validateRecipe -- Required Fields", () => {
 // -------------------------------------------------------------------
 
 describe("new-implementation recipe.yaml", () => {
-  it("loads without errors from the recipes directory", async () => {
+  // Load the live recipe once for the entire group. The recipe YAML is
+  // read-only during tests so a single load avoids redundant filesystem I/O.
+  let recipe: Awaited<ReturnType<typeof loadRecipes>> extends Map<
+    string,
+    infer V
+  >
+    ? V
+    : never;
+
+  beforeAll(async () => {
     const recipesDir = path.resolve(__dirname, "../../recipes");
     const result = await loadRecipes(recipesDir);
     expect(result.has("new-implementation")).toBe(true);
+    recipe = result.get("new-implementation")!;
   });
 
-  it("has correct metadata", async () => {
-    const recipesDir = path.resolve(__dirname, "../../recipes");
-    const result = await loadRecipes(recipesDir);
-    const recipe = result.get("new-implementation")!;
+  it("loads without errors from the recipes directory", () => {
+    expect(recipe).toBeDefined();
+  });
 
+  it("has correct metadata", () => {
     expect(recipe.id).toBe("new-implementation");
     expect(recipe.name).toBe("New Implementation");
     expect(recipe.command).toBe("/new-implementation");
@@ -769,6 +779,46 @@ describe("new-implementation recipe.yaml", () => {
     expect(recipe.description).toBeDefined();
     expect(recipe.orchestrator).toBeDefined();
     expect(recipe.orchestrator.backend).toBe("cli-claude");
+  });
+
+  it("stage_order includes commit_and_pr after planning", () => {
+    expect(recipe.stage_order).toEqual(["planning", "commit_and_pr"]);
+  });
+
+  it("commit_and_pr stage definition exists with required fields", () => {
+    expect(recipe.stages.commit_and_pr).toBeDefined();
+    expect(recipe.stages.commit_and_pr.role).toBeTruthy();
+    expect(recipe.stages.commit_and_pr.objective).toBeTruthy();
+  });
+
+  it("commit_and_pr stage allowed_scripts includes all four delivery action IDs", () => {
+    const scripts = recipe.stages.commit_and_pr.allowed_scripts;
+    expect(scripts).toContain("delivery.stage_explicit");
+    expect(scripts).toContain("delivery.commit_with_trailers");
+    expect(scripts).toContain("delivery.push_branch");
+    expect(scripts).toContain("delivery.upsert_draft_pr");
+  });
+
+  it("planning stage transitions to commit_and_pr", () => {
+    expect(recipe.stages.planning.allowed_transitions).toContain("commit_and_pr");
+  });
+
+  it("commit_and_pr stage has empty allowed_transitions (terminal stage)", () => {
+    expect(recipe.stages.commit_and_pr.allowed_transitions).toEqual([]);
+  });
+
+  it("commit_and_pr stage has defined inputs from planning outputs", () => {
+    const inputs = recipe.stages.commit_and_pr.inputs;
+    expect(inputs.length).toBeGreaterThan(0);
+    expect(inputs[0].source).toBeDefined();
+    expect(inputs[0].description).toBeDefined();
+  });
+
+  it("commit_and_pr stage has PR URL output", () => {
+    const outputs = recipe.stages.commit_and_pr.outputs;
+    expect(outputs.length).toBeGreaterThan(0);
+    expect(outputs[0].label).toBeDefined();
+    expect(outputs[0].format).toBeDefined();
   });
 });
 

@@ -23,7 +23,7 @@
  * Exported as a const array so downstream validators can perform runtime
  * membership checks without duplicating the literal values.
  */
-export const SCRIPT_RUNTIMES = ["python", "node", "shell"] as const;
+export const SCRIPT_RUNTIMES = ["python", "node", "shell", "internal"] as const;
 
 /** Script execution runtime union type derived from {@link SCRIPT_RUNTIMES}. */
 export type ScriptRuntime = (typeof SCRIPT_RUNTIMES)[number];
@@ -38,7 +38,7 @@ export type ScriptRuntime = (typeof SCRIPT_RUNTIMES)[number];
  * Exported as a const array so downstream validators can perform runtime
  * membership checks without duplicating the literal values.
  */
-export const SIDE_EFFECT_LEVELS = ["read-only", "workspace-write"] as const;
+export const SIDE_EFFECT_LEVELS = ["read-only", "workspace-write", "external-write"] as const;
 
 /** Side-effect level union type derived from {@link SIDE_EFFECT_LEVELS}. */
 export type SideEffectLevel = (typeof SIDE_EFFECT_LEVELS)[number];

@@ -1,5 +1,7 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execSync } from "node:child_process";
+import { mkdtemp, writeFile, rm, mkdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,14 +13,15 @@ const PROJECT_ROOT = path.resolve(__dirname, "../..");
 // Group 1: ScriptRuntime (src/scripts/types.ts)
 // -------------------------------------------------------------------
 describe("ScriptRuntime", () => {
-  it("exports SCRIPT_RUNTIMES const array with three values", async () => {
+  it("exports SCRIPT_RUNTIMES const array with four values", async () => {
     const mod = await import("../../src/scripts/types.js");
     expect(mod.SCRIPT_RUNTIMES).toBeDefined();
     const runtimes = mod.SCRIPT_RUNTIMES as readonly string[];
-    expect(runtimes).toHaveLength(3);
+    expect(runtimes).toHaveLength(4);
     expect(runtimes).toContain("python");
     expect(runtimes).toContain("node");
     expect(runtimes).toContain("shell");
+    expect(runtimes).toContain("internal");
   });
 });
 
@@ -26,13 +29,71 @@ describe("ScriptRuntime", () => {
 // Group 2: SideEffectLevel (src/scripts/types.ts)
 // -------------------------------------------------------------------
 describe("SideEffectLevel", () => {
-  it("exports SIDE_EFFECT_LEVELS const array with two values", async () => {
+  it("exports SIDE_EFFECT_LEVELS const array with all three levels in escalating order", async () => {
     const mod = await import("../../src/scripts/types.js");
     expect(mod.SIDE_EFFECT_LEVELS).toBeDefined();
     const levels = mod.SIDE_EFFECT_LEVELS as readonly string[];
-    expect(levels).toHaveLength(2);
+    expect(levels).toHaveLength(3);
     expect(levels).toContain("read-only");
     expect(levels).toContain("workspace-write");
+    expect(levels).toContain("external-write");
+    // Verify escalating severity ordering (read < write < external)
+    expect(levels[0]).toBe("read-only");
+    expect(levels[1]).toBe("workspace-write");
+    expect(levels[2]).toBe("external-write");
+  });
+});
+
+// -------------------------------------------------------------------
+// Group 2b: Registry integration for external-write level
+// -------------------------------------------------------------------
+
+const EXTERNAL_WRITE_MANIFEST_YAML = `
+scripts:
+  - script_id: delivery.push_branch
+    description: "Push current branch to remote"
+    runtime: shell
+    path: scripts/delivery/push_branch.sh
+    timeout_ms: 30000
+    retryable: false
+    side_effects: external-write
+    required_env: []
+    rerun_policy: restart
+`;
+
+describe("SideEffectLevel registry integration", () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(path.join(tmpdir(), "bees-types-test-"));
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("accepts external-write as a valid side_effects value in a manifest entry", async () => {
+    const { loadScriptRegistry } = await import(
+      "../../src/scripts/registry.js"
+    );
+
+    const manifestPath = path.join(tempDir, "manifest.yaml");
+    await writeFile(manifestPath, EXTERNAL_WRITE_MANIFEST_YAML, "utf-8");
+
+    const scriptDir = path.join(tempDir, "scripts", "delivery");
+    await mkdir(scriptDir, { recursive: true });
+    await writeFile(
+      path.join(scriptDir, "push_branch.sh"),
+      "#!/bin/sh\n# placeholder",
+      "utf-8",
+    );
+
+    const registry = await loadScriptRegistry(manifestPath, tempDir);
+    expect(registry.size).toBe(1);
+    expect(registry.has("delivery.push_branch")).toBe(true);
+
+    const entry = registry.get("delivery.push_branch")!;
+    expect(entry.side_effects).toBe("external-write");
   });
 });
 
