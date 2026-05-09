@@ -1,4 +1,4 @@
-# Bees
+# Beesy
 
 Agent orchestration platform that turns Slack slash commands into automated AI workflows.
 
