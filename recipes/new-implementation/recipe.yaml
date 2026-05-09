@@ -13,39 +13,198 @@ orchestrator:
   max_stage_retries: 2
   max_total_actions: 40
 
+cycle_policy: allow
+
 stage_order:
-  - planning
+  - planning_check
+  - create_planning
+  - historical_search
+  - adjust_planning
+  - prime_codebase
+  - prime_knowledge
+  - prime_guidelines
+  - create_tasks
+  - batch_implement
   - commit_and_pr
 
-start_stage: planning
+start_stage: planning_check
 
 stages:
-  planning:
+  # Stage 1: Evaluate the incoming request and decide whether new planning
+  # is needed or an existing plan can be reused.
+  planning_check:
+    role: roles/implementation/planning-check.md
+    objective: "Evaluate the request and determine whether new planning is required"
+    inputs:
+      - description: "User request"
+        source: task.payload.description
+    outputs:
+      - label: planning_check_result
+        format: json
+    allowed_transitions:
+      - create_planning
+    allowed_scripts: []
+
+  # Stage 2: Produce the initial implementation plan from the user request
+  # and planning check results. Pauses for operator review before proceeding.
+  create_planning:
     role: roles/implementation/planning-create.md
     objective: "Analyze the request and produce an implementation plan"
     inputs:
       - description: "User request"
         source: task.payload.description
+      - description: "Planning check result"
+        source: artifacts.planning_check_result
     outputs:
       - label: planning_doc
         format: md
         mirror_to:
           - ".bees/planning.md"
     allowed_transitions:
-      - commit_and_pr
+      - historical_search
+      - planning_check
+    allowed_scripts: []
+
+  # Stage 3: Search repository history for prior solutions, patterns, and
+  # relevant context that may inform the implementation plan. Checkpoint:
+  # discuss_and_confirm with the operator.
+  historical_search:
+    role: roles/implementation/historical-search.md
+    objective: "Search repository history for prior solutions and relevant context"
+    inputs:
+      - description: "Planning document"
+        source: artifacts.planning_doc
+    outputs:
+      - label: solution_path
+        format: md
+    allowed_transitions:
+      - adjust_planning
+      - create_planning
+    allowed_scripts:
+      - repo.search
+      - repo.git_history
+
+  # Stage 4: Revise the planning document based on historical findings and
+  # any operator feedback. May return to full plan creation if a rewrite
+  # is warranted.
+  adjust_planning:
+    role: roles/implementation/planning-adjust.md
+    objective: "Adjust the implementation plan based on historical findings"
+    inputs:
+      - description: "Planning document"
+        source: artifacts.planning_doc
+      - description: "Historical search findings"
+        source: artifacts.solution_path
+    outputs:
+      - label: adjusted_planning_doc
+        format: md
+        mirror_to:
+          - ".bees/planning.md"
+    allowed_transitions:
+      - prime_codebase
+      - create_planning
+    allowed_scripts: []
+
+  # Stage 5: Map the codebase structure and locate files relevant to the
+  # adjusted plan. May return to planning adjustment if structural
+  # analysis reveals gaps.
+  prime_codebase:
+    role: roles/implementation/codebase-map.md
+    objective: "Map codebase structure and locate files relevant to the plan"
+    inputs:
+      - description: "Adjusted planning document"
+        source: artifacts.adjusted_planning_doc
+    outputs:
+      - label: codebase_map
+        format: md
+    allowed_transitions:
+      - prime_knowledge
+      - adjust_planning
+    allowed_scripts:
+      - repo.search
+      - repo.file_map
+
+  # Stage 6: Synthesize knowledge from the codebase map and planning
+  # context to build a comprehensive understanding of the implementation
+  # domain.
+  prime_knowledge:
+    role: roles/implementation/knowledge-synthesis.md
+    objective: "Synthesize knowledge context from codebase and planning artifacts"
+    inputs:
+      - description: "Adjusted planning document"
+        source: artifacts.adjusted_planning_doc
+      - description: "Codebase map"
+        source: artifacts.codebase_map
+    outputs:
+      - label: knowledge_context
+        format: md
+    allowed_transitions:
+      - prime_guidelines
     allowed_scripts:
       - knowledge.prime
+
+  # Stage 7: Extract and consolidate relevant coding guidelines and
+  # conventions from the knowledge context for downstream task creation.
+  prime_guidelines:
+    role: roles/implementation/guidelines.md
+    objective: "Extract and consolidate coding guidelines and conventions"
+    inputs:
+      - description: "Knowledge context"
+        source: artifacts.knowledge_context
+    outputs:
+      - label: guidelines_doc
+        format: md
+    allowed_transitions:
+      - create_tasks
+    allowed_scripts: []
+
+  # Stage 8: Break the adjusted plan into discrete implementation tasks
+  # with clear scope and acceptance criteria. Checkpoint: approve_or_adjust
+  # with the operator before proceeding to batch implementation.
+  create_tasks:
+    role: roles/implementation/task-breakdown.md
+    objective: "Break the plan into discrete implementation tasks"
+    inputs:
+      - description: "Adjusted planning document"
+        source: artifacts.adjusted_planning_doc
+      - description: "Codebase map"
+        source: artifacts.codebase_map
+      - description: "Guidelines document"
+        source: artifacts.guidelines_doc
+    outputs:
+      - label: task_pack
+        format: json
+    allowed_transitions:
+      - batch_implement
+      - adjust_planning
+    allowed_scripts: []
+
+  # Stage 9: Execute the task pack through the batch implementation
+  # pipeline. May return to task creation if decomposition issues
+  # are discovered during implementation.
+  batch_implement:
+    role: roles/implementation/implementation-coordinator.md
+    objective: "Execute batch implementation of the task pack"
+    inputs:
+      - description: "Task pack"
+        source: artifacts.task_pack
+    outputs:
+      - label: implementation_result
+        format: md
+    allowed_transitions:
+      - commit_and_pr
+      - create_tasks
+    allowed_scripts:
       - implementation.batch_bridge
 
-  # Stage 2: Commit, push, and open a draft PR for the implementation.
-  # All four delivery actions are registered in the script manifest and
-  # validated by the decision validator before execution.
+  # Stage 10: Stage changes, create commit, push branch, and open a draft
+  # PR for the implementation. Terminal stage with no outgoing transitions.
   commit_and_pr:
-    role: roles/delivery/commit-and-pr.md
+    role: roles/implementation/delivery-coordinator.md
     objective: "Stage changes, create commit, push branch, and open draft PR"
     inputs:
-      - description: "Planning document from planning stage"
-        source: artifacts.planning_doc
+      - description: "Implementation result from batch stage"
+        source: artifacts.implementation_result
     outputs:
       - label: pr_url
         format: url
